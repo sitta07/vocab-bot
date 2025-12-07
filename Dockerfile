@@ -1,6 +1,5 @@
 # ใช้ Python Image ตัวเล็กๆ จะได้เบา
-FROM python:3.9-slim
-
+FROM python:3.10-slim
 # ตั้ง Folder ทำงาน
 WORKDIR /app
 
