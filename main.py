@@ -20,19 +20,26 @@ handler = WebhookHandler(LINE_SECRET)
 
 # 2. Setup Gemini
 genai.configure(api_key=GEMINI_API_KEY)
+
+# --- 🔍 DEBUG MODE: ปริ้นท์รายชื่อโมเดลออกมาดูใน Log Render ---
+print("\n--- AVAILABLE GEMINI MODELS ---")
 try:
-    print("Available Models:")
     for m in genai.list_models():
         if 'generateContent' in m.supported_generation_methods:
             print(f"- {m.name}")
 except Exception as e:
     print(f"Error listing models: {e}")
-# ---------------------------------------------
+print("-------------------------------\n")
+# -----------------------------------------------------------
 
-# ลองใช้ชื่อ 'gemini-pro' (ตัวเสถียรสุด)
-model = genai.GenerativeModel('gemini-pro')
+# 🔥 แก้ชื่อโมเดลตามข้อมูลที่คุณหามา (หรือลอง 'gemini-pro' ถ้าอันนี้ไม่ได้)
+model = genai.GenerativeModel('gemini-flash-latest') 
+
 # 3. Setup Supabase
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    print(f"Supabase Connection Error: {e}")
 
 @app.post("/callback")
 async def callback(request: Request):
@@ -48,58 +55,38 @@ async def callback(request: Request):
 def handle_message(event):
     user_msg = event.message.text.strip()
     
-    # --- Logic: การเพิ่มคำศัพท์ (รองรับทั้งไทยและอังกฤษ) ---
     if user_msg.lower().startswith(("เพิ่ม:", "add:")):
         word = user_msg.split(":", 1)[1].strip()
-        
         if not word:
-            reply_text = "กรุณาพิมพ์คำศัพท์หลังเครื่องหมาย : ด้วยครับ เช่น 'เพิ่ม: แมว' หรือ 'Add: Cat'"
+            reply_text = "อย่าลืมใส่คำศัพท์หลัง : นะครับ"
         else:
             try:
-                # 🔥 แก้ Prompt ให้ฉลาดขึ้น (Auto-detect Language)
+                # Prompt
                 prompt = (f"The user input is '{word}'. "
-                          f"1. Detect language: If it's English, translate to Thai. If it's Thai, translate to English. "
-                          f"2. Provide the translation as 'Meaning'. "
-                          f"3. Provide one simple example sentence in English using the English version of the word. "
-                          f"Format your response exactly like this:\n"
-                          f"Meaning: [Translation]\n"
-                          f"Example: [English Example Sentence]")
+                          f"1. If English, translate to Thai. If Thai, translate to English. "
+                          f"2. Provide Meaning and one Example sentence in English. "
+                          f"Format:\nMeaning: ...\nExample: ...")
                 
                 response = model.generate_content(prompt)
                 ai_text = response.text.strip()
                 
-                # Parsing logic (เหมือนเดิม)
+                # Parsing
                 meaning = "No meaning found"
                 example = "No example found"
-                
-                lines = ai_text.split('\n')
-                for line in lines:
-                    if line.startswith("Meaning:"):
-                        meaning = line.replace("Meaning:", "").strip()
-                    elif line.startswith("Example:"):
-                        example = line.replace("Example:", "").strip()
+                for line in ai_text.split('\n'):
+                    if line.startswith("Meaning:"): meaning = line.replace("Meaning:", "").strip()
+                    elif line.startswith("Example:"): example = line.replace("Example:", "").strip()
 
-                # บันทึกลง Supabase
-                data = {
-                    "word": word, # เก็บคำที่ User พิมพ์มา (จะเป็นไทยหรืออังกฤษก็ได้)
-                    "meaning": meaning,
-                    "example_sentence": example
-                }
+                # Save to DB
+                data = {"word": word, "meaning": meaning, "example_sentence": example}
                 supabase.table("vocab").insert(data).execute()
 
-                reply_text = (f"✅ บันทึกคำว่า '{word}' เรียบร้อย!\n\n"
-                              f"📍 แปลว่า: {meaning}\n"
-                              f"📝 ตัวอย่าง: {example}")
+                reply_text = f"✅ บันทึก '{word}' แล้ว!\n📍 {meaning}\n📝 {example}"
                 
             except Exception as e:
-                print(f"Error: {e}")
-                reply_text = "ขอโทษครับ ระบบมีปัญหาตอนบันทึก ลองใหม่อีกครั้งนะ"
-
-    # --- Logic: อื่นๆ ---
+                print(f"Error during process: {e}") # ดู Log ตรงนี้ถ้าพัง
+                reply_text = "ขอโทษครับ ระบบมีปัญหา (เช็ค Log Render หน่อย)"
     else:
-        reply_text = "พิมพ์ 'เพิ่ม: [คำศัพท์]' เพื่อบันทึกคำศัพท์ใหม่นะครับ"
+        reply_text = "พิมพ์ 'เพิ่ม: [ศัพท์]' เพื่อจดศัพท์นะ"
 
-    line_bot_api.reply_message(
-        event.reply_token,
-        TextSendMessage(text=reply_text)
-    )
+    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
