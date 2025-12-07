@@ -1,16 +1,16 @@
-# ใช้ Python Image ตัวเล็กๆ จะได้เบา
 FROM python:3.10-slim
-# ตั้ง Folder ทำงาน
+
+# ตั้ง Folder งาน
 WORKDIR /app
 
-# ลง Library
+# ก๊อปไฟล์ requirements และติดตั้ง
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# เอา Code ใส่เข้าไป
+# ก๊อปไฟล์ Code ทั้งหมด
 COPY . .
 
-# เปิด Port 8080 (Cloud Run ชอบ Port นี้)
+# เปิด Port 8080
 ENV PORT=8080
 
 # คำสั่ง Run App
