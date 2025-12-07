@@ -26,7 +26,8 @@ line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-flash-latest')
+# แนะนำให้ใช้ gemini-1.5-flash หรือ model ที่ใหม่ที่สุดที่มีเพื่อความแม่นยำทางภาษา
+model = genai.GenerativeModel('gemini-1.5-flash') 
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
@@ -92,11 +93,11 @@ def handle_message(event):
     
     # 1. เมนูคำสั่ง
     if user_msg == "คำสั่ง":
-        reply_text = (f"🤖 คู่มือการใช้งาน:\n\n"
+        reply_text = (f"🤖 เมนูหลัก:\n\n"
                       f"1. เพิ่ม: [ศัพท์] -> จดศัพท์ใหม่\n"
-                      f"2. ลบคำศัพท์: [ศัพท์] -> ลบศัพท์และประวัติทิ้ง\n"
+                      f"2. ลบคำศัพท์: [ศัพท์] -> ลบศัพท์ทิ้ง\n"
                       f"3. คลังคำศัพท์ -> ดูรายการศัพท์\n"
-                      f"4. พิมพ์ประโยคอังกฤษ -> ส่งการบ้าน")
+                      f"4. (พิมพ์ประโยคอังกฤษ) -> ส่งการบ้าน")
 
     # 2. ดูคลัง
     elif user_msg == "คลังคำศัพท์":
@@ -104,39 +105,31 @@ def handle_message(event):
             response = supabase.table("vocab").select("word").order("id", desc=True).limit(20).execute()
             words = response.data
             if not words:
-                reply_text = "📭 คลังว่างเปล่า ลองพิมพ์ 'เพิ่ม: [ศัพท์]' ดูสิ!"
+                reply_text = "📭 คลังว่างเปล่า พิมพ์ 'เพิ่ม: [ศัพท์]' ได้เลย!"
             else:
                 word_list = "\n".join([f"- {item['word']}" for item in words])
-                reply_text = f"📚 ศัพท์ล่าสุด ({len(words)} คำ):\n\n{word_list}"
+                reply_text = f"📚 ศัพท์ล่าสุด ({len(words)}):\n\n{word_list}"
         except:
             reply_text = "ดึงข้อมูลพลาด ลองใหม่นะครับ"
 
-    # 3. ลบคำศัพท์ (แก้บั๊ก Foreign Key แล้ว ✅)
+    # 3. ลบคำศัพท์
     elif user_msg.startswith("ลบคำศัพท์:"):
         try:
             word_to_delete = user_msg.split(":", 1)[1].strip()
             if not word_to_delete:
-                reply_text = "⚠️ ระบุคำที่จะลบหลัง : ด้วยนะครับ"
+                reply_text = "⚠️ ระบุศัพท์หลัง : ด้วยนะครับ"
             else:
-                # Step 1: หา ID
                 search_res = supabase.table("vocab").select("id, word").ilike("word", word_to_delete).execute()
-                
                 if not search_res.data:
-                    reply_text = f"❌ หาคำว่า '{word_to_delete}' ไม่เจอครับ"
+                    reply_text = f"❌ ไม่เจอคำว่า '{word_to_delete}' ครับ"
                 else:
                     target_id = search_res.data[0]['id']
                     real_word = search_res.data[0]['word']
-
-                    # Step 2: ลบ Logs ก่อน
                     supabase.table("user_logs").delete().eq("vocab_id", target_id).execute()
-
-                    # Step 3: ลบ Vocab
                     supabase.table("vocab").delete().eq("id", target_id).execute()
-                    
-                    reply_text = f"🗑️ ล้างบาง! ลบคำว่า '{real_word}' เรียบร้อยครับ"
+                    reply_text = f"🗑️ ลบ '{real_word}' เรียบร้อย"
         except Exception as e:
-            print(f"Delete Error: {e}")
-            reply_text = f"❌ ระบบลบขัดข้อง: {str(e)}"
+            reply_text = f"❌ ลบไม่สำเร็จ: {str(e)}"
 
     # 4. เพิ่มศัพท์
     elif user_msg.lower().startswith(("เพิ่ม:", "add:")):
@@ -145,7 +138,7 @@ def handle_message(event):
         except:
             word = ""  
         if not word:
-            reply_text = "อย่าลืมใส่ศัพท์หลัง : นะครับ"
+            reply_text = "⚠️ ใส่ศัพท์หลัง : ด้วยนะครับ"
         else:
             try:
                 prompt = (f"Word: '{word}'. Translate (EN<->TH), Meaning, Example. "
@@ -160,26 +153,42 @@ def handle_message(event):
                 supabase.table("vocab").insert({"word": word, "meaning": meaning, "example_sentence": example}).execute()
                 reply_text = f"✅ จดแล้ว!\n🔤 {word}\n📖 {meaning}\n🗣️ {example}"
             except Exception as e:
-                print(e)
                 reply_text = "ระบบรวนนิดหน่อย ลองใหม่นะครับ"
 
-    # 5. ตรวจการบ้าน 
+    # 5. ตรวจการบ้าน (Logic ใหม่: แก้ไข + แปล)
     else:
-        reply_text = "ขอตรวจแป๊บ... 🧐"
+        # กรองข้อความสั้นเกินไป
+        if len(user_msg) < 3: 
+            return
+
         try:
-            prompt = (f"User sentence: '{user_msg}'\n"
-                      f"Task: Identify main word, Check context usage, IGNORE minor punctuation/caps.\n"
-                      f"Format:\nWord: [Main word]\nCorrect: [Yes/No]\nFeedback: [Thai encouragement]")
+            # Prompt สั่งให้ AI ตรวจ + แก้ + แปล
+            prompt = (f"User input: '{user_msg}'\n"
+                      f"Role: English Teacher.\n"
+                      f"Task: Evaluate if this is a valid English sentence trying to use a vocabulary word.\n"
+                      f"Rules:\n"
+                      f"1. If input is gibberish, greeting (Hi/Hello), or not a sentence -> Respond 'SKIP'\n"
+                      f"2. If Incorrect -> Provide 'Correction' (rewrite correctly) AND 'Feedback' (Explain in Thai why it's wrong + Translate the correction).\n"
+                      f"3. If Correct -> 'Correction' is '-' AND 'Feedback' is praise in Thai.\n"
+                      f"Format:\nWord: [Main word]\nCorrect: [Yes/No]\nCorrection: [Corrected Sentence]\nFeedback: [Thai explanation]")
             
             res = model.generate_content(prompt)
             ai_text = res.text.strip()
+
+            if "SKIP" in ai_text:
+                return
+
+            detected_word, is_correct, correction, feedback = "Unknown", False, "-", ""
             
-            detected_word, is_correct, feedback = "", False, ""
+            # Parsing Response
             for line in ai_text.split('\n'):
+                line = line.strip()
                 if line.startswith("Word:"): detected_word = line.replace("Word:", "").strip()
                 elif line.startswith("Correct:"): is_correct = "Yes" in line
+                elif line.startswith("Correction:"): correction = line.replace("Correction:", "").strip()
                 elif line.startswith("Feedback:"): feedback = line.replace("Feedback:", "").strip()
 
+            # Logging
             vocab_data = supabase.table("vocab").select("id").ilike("word", detected_word).execute().data
             vocab_id = vocab_data[0]['id'] if vocab_data else None
             
@@ -190,9 +199,19 @@ def handle_message(event):
                 "is_correct": is_correct
             }).execute()
 
-            icon = "🎉 แจ๋วเลย!" if is_correct else "🤏 นิดนึงนะ..."
-            reply_text = f"{icon}\nศัพท์: {detected_word}\nผล: {'✅ ผ่าน' if is_correct else '❌ แก้ไข'}\n\n💬 {feedback}"
-        except Exception as e:
-            reply_text = "ครู AI มึนหัวนิดหน่อย ส่งใหม่นะครับ"
+            # สร้างข้อความตอบกลับ
+            if is_correct:
+                reply_text = f"🎉 สุดยอด! ({detected_word})\n✅ ถูกต้องครับเป๊ะมาก\n\n💬 {feedback}"
+            else:
+                # กรณีผิด: แสดงสิ่งที่ถูก + คำแปล
+                reply_text = (f"🤏 เกือบถูกแล้ว! ({detected_word})\n"
+                              f"❌ ยังมีจุดแก้นิดหน่อยครับ\n\n"
+                              f"💡 ประโยคที่ถูก: {correction}\n"
+                              f"💬 คำแนะนำ: {feedback}")
 
-    line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        except Exception as e:
+            print(f"AI Check Error: {e}")
+            return # เงียบไปถ้า Error
+
+    if reply_text:
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
