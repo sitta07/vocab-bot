@@ -20,8 +20,7 @@ handler = WebhookHandler(LINE_SECRET)
 
 # 2. Setup Gemini
 genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel('gemini-1.5-flash')
-
+model = genai.GenerativeModel('gemini-1.5-flash-latest')
 # 3. Setup Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 

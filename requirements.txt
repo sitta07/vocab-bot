@@ -2,5 +2,5 @@ fastapi
 uvicorn
 line-bot-sdk
 python-dotenv
-google-generativeai
+google-generativeai>=0.7.0
 supabase
