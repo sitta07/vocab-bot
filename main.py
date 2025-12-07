@@ -20,6 +20,16 @@ handler = WebhookHandler(LINE_SECRET)
 
 # 2. Setup Gemini
 genai.configure(api_key=GEMINI_API_KEY)
+try:
+    print("Available Models:")
+    for m in genai.list_models():
+        if 'generateContent' in m.supported_generation_methods:
+            print(f"- {m.name}")
+except Exception as e:
+    print(f"Error listing models: {e}")
+# ---------------------------------------------
+
+# ลองใช้ชื่อ 'gemini-pro' (ตัวเสถียรสุด)
 model = genai.GenerativeModel('gemini-pro')
 # 3. Setup Supabase
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
