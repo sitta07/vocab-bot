@@ -1,8 +1,8 @@
-name: Daily Vocab Quiz Trigger
+name: Daily Vocab Quiz Trigger (3 Times)
 
 on:
   schedule:
-    - cron: '0 1 * * *'  # รันทุกวันตอนตี 1 UTC (8 โมงเช้าไทย)
+    - cron: '0 1,5,11 * * *'
   
   workflow_dispatch:
 
@@ -10,8 +10,7 @@ jobs:
   wake-up-and-quiz:
     runs-on: ubuntu-latest
     steps:
-      - name: Wake up Render and Trigger Quiz
+      - name: Trigger Quiz via API
         run: |
-          # ยิงคำสั่งไปที่บอทของเรา
-          # เปลี่ยน URL ด้านล่างเป็นของ Render คุณนะครับ
+          # ยิงคำสั่งไปที่บอทให้เริ่มทำงานทันที (ไม่มี Delay)
           curl -X GET https://vocab-bot-owak.onrender.com/broadcast-quiz
