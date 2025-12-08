@@ -12,6 +12,7 @@ from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from supabase import create_client, Client
 from dotenv import load_dotenv
 from functools import wraps
+from datetime import datetime
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
@@ -96,14 +97,27 @@ def sanitize_word(word):
 def log_operation(user_id, operation, details=""):
     """บันทึกการดำเนินการ"""
     try:
-        logger.info(f"User:{user_id} | Operation:{operation} | Details:{details}")
-        # บันทึกลง DB ด้วย
-        supabase.table("logs").insert({
-            "user_id": user_id,
-            "operation": operation,
-            "details": str(details),
-            "timestamp": int(time.time())
-        }).execute()
+        log_msg = f"User:{user_id} | Operation:{operation} | Details:{details}"
+        logger.info(log_msg)
+        print(f"📝 LOG: {log_msg}")
+        
+        # ลองบันทึกลง DB
+        try:
+            supabase.table("logs").insert({
+                "user_id": user_id,
+                "operation": operation,
+                "details": str(details),
+                "timestamp": int(time.time())
+            }).execute()
+        except Exception as db_error:
+            # ถ้าไม่มีตาราง logs ให้สร้างตาราง user_logs แทน
+            if "Could not find the table" in str(db_error) and "logs" in str(db_error):
+                logger.warning("Table 'logs' not found, skipping DB logging")
+                # สร้างตารางผ่าน Python ไม่ได้ใน Supabase ต้องสร้างผ่าน SQL
+                print("ℹ️ Note: Please create 'logs' table in Supabase SQL Editor")
+            else:
+                logger.error(f"Logging to DB failed: {db_error}")
+                
     except Exception as e:
         logger.error(f"Logging error: {e}")
 
@@ -182,10 +196,33 @@ def get_random_vocab(exclude_words=[]):
         logger.error(f"Get random vocab error: {e}")
         return None
 
+def save_user_log(user_id, vocab_id, is_correct, user_answer):
+    """บันทึกประวัติการตอบ"""
+    try:
+        supabase.table("user_logs").insert({
+            "user_id": user_id,
+            "vocab_id": vocab_id,
+            "is_correct": is_correct,
+            "user_answer": user_answer
+        }).execute()
+    except Exception as e:
+        logger.error(f"Save user log error: {e}")
+
+def get_vocab_id_by_word(word):
+    """หาค่า id ของคำศัพท์จาก word"""
+    try:
+        result = supabase.table("vocab").select("id").eq("word", word).execute()
+        if result.data:
+            return result.data[0]['id']
+        return None
+    except Exception as e:
+        logger.error(f"Get vocab id error: {e}")
+        return None
+
 # --- 3. API ENDPOINTS ---
 @app.get("/")
 def health_check():
-    return {"status": "ok", "msg": "Teacher Bot V2 (Senior Logic) is ready!", "time": time.time()}
+    return {"status": "ok", "msg": "Teacher Bot V2 (Senior Logic) is ready!", "time": datetime.now().isoformat()}
 
 @app.get("/broadcast-quiz")
 def broadcast_quiz():
@@ -217,7 +254,8 @@ def broadcast_quiz():
                 user_sessions[user_id] = {
                     'word': word,
                     'meaning': meaning,
-                    'hint_given': False
+                    'hint_given': False,
+                    'vocab_id': selected.get('id')
                 }
                 success_count += 1
                 log_operation(user_id, "broadcast_quiz", word)
@@ -262,7 +300,9 @@ def handle_message(event):
                       f"4. เพิ่ม: [ศัพท์] -> เพิ่มคำใหม่\n"
                       f"5. ลบ: [ศัพท์] -> ลบคำ\n"
                       f"6. คลัง -> ดูศัพท์ทั้งหมด\n"
-                      f"7. สิทธ์ -> ตรวจสอบสิทธิ์\n\n"
+                      f"7. สิทธ์ -> ตรวจสอบสิทธิ์\n"
+                      f"8. ตรวจสอบระบบ -> สำหรับแอดมิน\n"
+                      f"9. ยกเลิก -> ยกเลิกการกระทำ\n\n"
                       f"📊 คะแนน: {score} | 📚 จำได้: {len(learned)} คำ")
 
     # === MENU 2: คะแนน ===
@@ -292,7 +332,8 @@ def handle_message(event):
             user_sessions[user_id] = {
                 'word': word,
                 'meaning': meaning,
-                'hint_given': False
+                'hint_given': False,
+                'vocab_id': selected.get('id')
             }
             
             reply_text = (f"🎮 เริ่มกันเลย!\n\n"
@@ -338,28 +379,16 @@ def handle_message(event):
                 # ขั้นตอนที่ 2: ยืนยันการลบ
                 word_to_delete = pending_deletions[user_id]
                 
-                # ตรวจสอบสิทธิ์ (เฉพาะ admin หรือคนที่เพิ่มคำนั้น)
                 try:
-                    response = supabase.table("vocab")\
-                        .select("added_by")\
+                    # ลบจากฐานข้อมูล
+                    supabase.table("vocab")\
+                        .delete()\
                         .eq("word", word_to_delete)\
                         .execute()
                     
-                    if response.data:
-                        word_info = response.data[0]
-                        # อนุญาตให้ลบเฉพาะคำที่ตัวเองเพิ่ม (หรือ admin)
-                        # สามารถปรับ logic ตามต้องการ
-                        
-                        supabase.table("vocab")\
-                            .delete()\
-                            .eq("word", word_to_delete)\
-                            .execute()
-                        
-                        log_operation(user_id, "delete_word_confirmed", word_to_delete)
-                        reply_text = f"✅ ลบคำว่า '{word_to_delete}' เรียบร้อยแล้ว"
-                    else:
-                        reply_text = f"❌ คำว่า '{word_to_delete}' ไม่พบในระบบแล้ว"
-                        
+                    log_operation(user_id, "delete_word_confirmed", word_to_delete)
+                    reply_text = f"✅ ลบคำว่า '{word_to_delete}' เรียบร้อยแล้ว"
+                    
                 except Exception as e:
                     logger.error(f"Delete word error: {e}")
                     reply_text = f"⚠️ ลบคำว่า '{word_to_delete}' ไม่สำเร็จ: {str(e)[:100]}"
@@ -453,7 +482,7 @@ def handle_message(event):
                     example = data.get("example", "-")
 
                     # บันทึกลงฐานข้อมูล
-                    supabase.table("vocab").insert({
+                    result = supabase.table("vocab").insert({
                         "word": word, 
                         "meaning": meaning, 
                         "example_sentence": example,
@@ -461,17 +490,23 @@ def handle_message(event):
                         "added_at": int(time.time())
                     }).execute()
                     
-                    log_operation(user_id, "add_word", word)
+                    # ดึง ID ที่เพิ่งเพิ่ม
+                    vocab_id = None
+                    if result.data:
+                        vocab_id = result.data[0].get('id')
+                    
+                    log_operation(user_id, "add_word", f"word:{word}, id:{vocab_id}")
                     reply_text = (f"✅ จดศัพท์ใหม่แล้ว!\n\n"
                                 f"🔤 {word}\n"
                                 f"📖 {meaning}\n"
                                 f"🗣️ {example}")
                     
-        except json.JSONDecodeError:
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error: {e}")
             reply_text = "⚠️ AI ตอบกลับมาไม่ถูกรูปแบบ ลองใหม่อีกครั้งครับ"
         except Exception as e:
             logger.error(f"Add vocab error: {e}")
-            reply_text = "⚠️ มีปัญหากับ AI ลองพิมพ์ใหม่อีกรอบครับ"
+            reply_text = f"⚠️ มีปัญหากับระบบ: {str(e)[:100]}"
 
     # === MENU 8: ตรวจสอบสิทธิ์ ===
     elif user_msg in ["สิทธ์", "สิทธิ์", "สิทธิ", "role", "admin"]:
@@ -497,14 +532,21 @@ def handle_message(event):
                 user_result = supabase.table("users").select("*", count="exact").execute()
                 user_count = user_result.count or 0
                 
+                # นับคะแนน
+                score_result = supabase.table("user_scores").select("*", count="exact").execute()
+                score_count = score_result.count or 0
+                
                 # ตรวจสอบ sessions
                 active_sessions = len(user_sessions)
+                pending_deletions_count = len(pending_deletions)
                 
                 reply_text = (f"📊 สถิติระบบ:\n\n"
                             f"🗃️ คำศัพท์ทั้งหมด: {vocab_count} คำ\n"
                             f"👥 ผู้ใช้ทั้งหมด: {user_count} คน\n"
+                            f"⭐ ผู้ใช้มีคะแนน: {score_count} คน\n"
                             f"🎮 เซสชั่นปัจจุบัน: {active_sessions}\n"
-                            f"⏰ เวลาปัจจุบัน: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+                            f"🗑️ รอการยืนยันลบ: {pending_deletions_count}\n"
+                            f"⏰ เวลาปัจจุบัน: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
             except Exception as e:
                 logger.error(f"System check error: {e}")
                 reply_text = f"⚠️ ตรวจสอบระบบผิดพลาด: {str(e)[:100]}"
@@ -518,18 +560,19 @@ def handle_message(event):
             del pending_deletions[user_id]
             reply_text = f"✅ ยกเลิกการลบคำว่า '{word}' แล้ว"
         elif user_id in user_sessions:
+            word = user_sessions[user_id]['word']
             del user_sessions[user_id]
-            reply_text = "✅ ยกเลิกเกมปัจจุบันแล้ว"
+            reply_text = f"✅ ยกเลิกเกมคำว่า '{word}' แล้ว"
         else:
             reply_text = "🤔 ไม่มีอะไรให้ยกเลิกครับ"
 
-    # === DEFAULT: ตรวจคำตอบ (ปรับปรุงใหม่ ตอบทีเดียวจบ) ===
+    # === DEFAULT: ตรวจคำตอบ ===
     else:
         if user_id in pending_deletions:
             # ถ้ามี pending deletion แต่พิมพ์คำอื่น นั่นคือยกเลิก
             word = pending_deletions[user_id]
             del pending_deletions[user_id]
-            reply_text = f"❌ ยกเลิกการลบคำว่า '{word}' เพราะคุณพิมพ์: '{user_msg}'"
+            reply_text = f"❌ ยกเลิกการลบคำว่า '{word}' เพราะคุณพิมพ์: '{user_msg}'\n\nพิมพ์ 'คำสั่ง' เพื่อดูเมนู"
             
         elif user_id not in user_sessions:
             reply_text = "🤔 อยากเล่นเกมพิมพ์ 'เริ่มเกม' ได้เลยครับ\nหรือพิมพ์ 'คำสั่ง' เพื่อดูเมนู"
@@ -537,13 +580,14 @@ def handle_message(event):
             session = user_sessions[user_id]
             word = session['word']
             correct_meaning = session['meaning']
+            vocab_id = session.get('vocab_id')
             
             try:
                 # Prompt ชุดเดียว ได้ครบทุกอย่าง
                 prompt = (f"User is learning vocabulary. Word: '{word}' (Correct meaning: {correct_meaning}).\n"
                          f"User answered: '{user_msg}'\n\n"
                          f"Analyze and respond with:\n"
-                         f"1. is_correct: true/false (accept synonyms and similar meanings)\n"
+                         f"1. is_correct: true/false (accept synonyms and similar meanings in Thai)\n"
                          f"2. reason_thai: short explanation in Thai (friendly tone)\n"
                          f"3. examples: 3 simple English example sentences\n\n"
                          f"Response in strict JSON format only:\n"
@@ -564,10 +608,14 @@ def handle_message(event):
                 reason = result.get("reason_thai", "ไม่มีคำอธิบาย")
                 examples = result.get("examples", [])
                 
+                # บันทึกประวัติการตอบ
+                if vocab_id:
+                    save_user_log(user_id, vocab_id, is_correct, user_msg)
+                
                 # จัด Format ตัวอย่างประโยค
                 example_txt = "\n".join([f"• {ex}" for ex in examples]) if examples else "ไม่มีตัวอย่าง"
 
-                # ล้าง Session ทันที (One-shot Logic)
+                # ล้าง Session
                 del user_sessions[user_id]
 
                 if is_correct:
@@ -590,9 +638,10 @@ def handle_message(event):
                                  f"🌟 ดูตัวอย่างประโยคช่วยจำ:\n{example_txt}\n\n"
                                  f"ไม่ต้องซีเรียสครับ พิมพ์ 'เริ่มเกม' ลองคำใหม่เลย!")
                 
-                log_operation(user_id, "check_answer", f"word:{word}, correct:{is_correct}")
+                log_operation(user_id, "check_answer", f"word:{word}, correct:{is_correct}, score_change:{'10' if is_correct else '-2'}")
             
-            except json.JSONDecodeError:
+            except json.JSONDecodeError as e:
+                logger.error(f"JSON decode error in answer check: {e}")
                 reply_text = f"⚠️ AI ตอบกลับมาไม่ถูกรูปแบบ\n\nเฉลย: {word} แปลว่า \"{correct_meaning}\"\n\nลองตอบใหม่อีกครั้ง!"
                 # ไม่ลบ session ให้ลองใหม่
                 if user_id not in user_sessions:
@@ -618,17 +667,20 @@ def handle_message(event):
 def get_stats():
     """Get system statistics"""
     try:
-        vocab_count = supabase.table("vocab").select("*", count="exact").execute().count
-        user_count = supabase.table("users").select("*", count="exact").execute().count
+        vocab_count = supabase.table("vocab").select("*", count="exact").execute().count or 0
+        user_count = supabase.table("users").select("*", count="exact").execute().count or 0
+        score_count = supabase.table("user_scores").select("*", count="exact").execute().count or 0
         active_sessions = len(user_sessions)
+        pending_deletions_count = len(pending_deletions)
         
         return {
             "status": "ok",
             "vocabulary_count": vocab_count,
             "user_count": user_count,
+            "user_scores_count": score_count,
             "active_sessions": active_sessions,
-            "pending_deletions": len(pending_deletions),
-            "timestamp": time.time()
+            "pending_deletions": pending_deletions_count,
+            "timestamp": datetime.now().isoformat()
         }
     except Exception as e:
         logger.error(f"Get stats error: {e}")
@@ -648,6 +700,15 @@ def reset_user(user_id: str):
         return {"status": "ok", "message": f"Reset user {user_id}"}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
+
+@app.get("/vocab/count")
+def count_vocab():
+    """Count vocabulary"""
+    try:
+        result = supabase.table("vocab").select("*", count="exact").execute()
+        return {"count": result.count or 0}
+    except Exception as e:
+        return {"error": str(e)}
 
 # Run the app
 if __name__ == "__main__":
