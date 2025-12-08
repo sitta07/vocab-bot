@@ -1,7 +1,9 @@
-# gemini-flash-latest
 import os
 import random
 import json
+import time
+import re
+import logging
 import google.generativeai as genai
 from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookHandler
@@ -9,9 +11,17 @@ from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from supabase import create_client, Client
 from dotenv import load_dotenv
+from functools import wraps
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = FastAPI()
 
@@ -24,6 +34,7 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 
 # Check Keys
 if not all([LINE_ACCESS_TOKEN, LINE_SECRET, GEMINI_API_KEY, SUPABASE_URL, SUPABASE_KEY]):
+    logger.error("⚠️ Warning: Environment variables are missing!")
     print("⚠️ Warning: Environment variables are missing!")
 
 # Setup Clients
@@ -38,20 +49,71 @@ model = genai.GenerativeModel('gemini-flash-latest')
 # Setup Supabase
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    logger.info("✅ Supabase connected successfully")
 except Exception as e:
+    logger.error(f"Supabase Connection Error: {e}")
     print(f"Supabase Connection Error: {e}")
 
 # 🔥 GLOBAL STATE (RAM)
 # Structure: { 'user_id': {'word': 'revise', 'meaning': '...'} }
-# ตัด attempts ออกเพราะใช้ logic ตอบรอบเดียวจบ
 user_sessions = {}
+pending_deletions = {}  # สำหรับระบบลบแบบยืนยัน 2 ขั้นตอน
 
 # --- 2. HELPER FUNCTIONS ---
+def retry_on_failure(max_retries=3, delay=1):
+    """Decorator for retry logic"""
+    def decorator(func):
+        @wraps(func)
+        def wrapper(*args, **kwargs):
+            for attempt in range(max_retries):
+                try:
+                    return func(*args, **kwargs)
+                except Exception as e:
+                    if attempt == max_retries - 1:
+                        logger.error(f"Function {func.__name__} failed after {max_retries} attempts: {e}")
+                        raise
+                    logger.warning(f"Retry {attempt + 1}/{max_retries} for {func.__name__}: {e}")
+                    time.sleep(delay)
+            return None
+        return wrapper
+    return decorator
+
+def sanitize_word(word):
+    """ป้องกัน SQL injection และคำสั่งอันตราย"""
+    if not word:
+        return ""
+    
+    # ลบอักขระพิเศษ (อนุญาตเฉพาะ a-z, A-Z, 0-9, space, hyphen, apostrophe)
+    word = re.sub(r'[^\w\s\-\']', '', word, flags=re.UNICODE)
+    word = word.strip()
+    
+    # จำกัดความยาว
+    if len(word) > 50:
+        word = word[:50]
+    
+    return word
+
+def log_operation(user_id, operation, details=""):
+    """บันทึกการดำเนินการ"""
+    try:
+        logger.info(f"User:{user_id} | Operation:{operation} | Details:{details}")
+        # บันทึกลง DB ด้วย
+        supabase.table("logs").insert({
+            "user_id": user_id,
+            "operation": operation,
+            "details": str(details),
+            "timestamp": int(time.time())
+        }).execute()
+    except Exception as e:
+        logger.error(f"Logging error: {e}")
+
 def save_user(user_id):
     """เก็บ User ID ลง DB"""
     try:
         supabase.table("users").upsert({"user_id": user_id}, on_conflict="user_id").execute()
-    except: pass
+        log_operation(user_id, "save_user")
+    except Exception as e:
+        logger.error(f"Save user error: {e}")
 
 def get_user_score(user_id):
     """ดึงคะแนนปัจจุบัน"""
@@ -60,9 +122,11 @@ def get_user_score(user_id):
         if result.data:
             return result.data[0]['score'], result.data[0].get('learned_words', [])
         return 0, []
-    except:
+    except Exception as e:
+        logger.error(f"Get user score error: {e}")
         return 0, []
 
+@retry_on_failure(max_retries=2)
 def update_score(user_id, points):
     """เพิ่ม/ลดคะแนน"""
     try:
@@ -73,24 +137,33 @@ def update_score(user_id, points):
             "score": new_score,
             "learned_words": learned
         }, on_conflict="user_id").execute()
+        
+        log_operation(user_id, "update_score", f"points:{points}, new_score:{new_score}")
         return new_score
-    except:
+    except Exception as e:
+        logger.error(f"Update score error: {e}")
         return 0
 
 def mark_word_learned(user_id, word):
     """บันทึกว่าเรียนคำนี้แล้ว"""
     try:
         score, learned = get_user_score(user_id)
-        if word.lower() not in [w.lower() for w in learned]:
-            learned.append(word.lower())
+        word_lower = word.lower()
+        learned_lower = [w.lower() for w in learned]
+        
+        if word_lower not in learned_lower:
+            learned.append(word)
             supabase.table("user_scores").upsert({
                 "user_id": user_id,
                 "score": score,
                 "learned_words": learned
             }, on_conflict="user_id").execute()
-    except:
-        pass
+            
+            log_operation(user_id, "mark_word_learned", word)
+    except Exception as e:
+        logger.error(f"Mark word learned error: {e}")
 
+@retry_on_failure(max_retries=2)
 def get_random_vocab(exclude_words=[]):
     """สุ่มศัพท์ที่ยังไม่เคยเรียน"""
     try:
@@ -98,21 +171,21 @@ def get_random_vocab(exclude_words=[]):
         if not vocab_list:
             return None
         
-        # กรองคำที่เรียนแล้ว
-        available = [v for v in vocab_list if v['word'].lower() not in [w.lower() for w in exclude_words]]
+        exclude_lower = [w.lower() for w in exclude_words]
+        available = [v for v in vocab_list if v['word'].lower() not in exclude_lower]
         
         if not available:
-            # ถ้าเรียนหมดแล้ว ให้สุ่มจากทั้งหมด
             available = vocab_list
         
-        return random.choice(available)
-    except:
+        return random.choice(available) if available else None
+    except Exception as e:
+        logger.error(f"Get random vocab error: {e}")
         return None
 
 # --- 3. API ENDPOINTS ---
 @app.get("/")
 def health_check():
-    return {"status": "ok", "msg": "Teacher Bot V2 (Senior Logic) is ready!"}
+    return {"status": "ok", "msg": "Teacher Bot V2 (Senior Logic) is ready!", "time": time.time()}
 
 @app.get("/broadcast-quiz")
 def broadcast_quiz():
@@ -122,6 +195,7 @@ def broadcast_quiz():
         if not users: 
             return {"msg": "No users found"}
 
+        success_count = 0
         for user in users:
             user_id = user['user_id']
             _, learned = get_user_score(user_id)
@@ -139,16 +213,21 @@ def broadcast_quiz():
 
             try:
                 line_bot_api.push_message(user_id, TextSendMessage(text=msg))
-                # เก็บ session (ไม่ต้องมี attempts แล้ว)
+                # เก็บ session
                 user_sessions[user_id] = {
                     'word': word,
-                    'meaning': meaning
+                    'meaning': meaning,
+                    'hint_given': False
                 }
-            except: 
+                success_count += 1
+                log_operation(user_id, "broadcast_quiz", word)
+            except Exception as e:
+                logger.error(f"Push message error for user {user_id}: {e}")
                 continue 
             
-        return {"status": "success", "sent_to": len(users)}
+        return {"status": "success", "sent_to": success_count, "total_users": len(users)}
     except Exception as e:
+        logger.error(f"Broadcast quiz error: {e}")
         return {"status": "error", "detail": str(e)}
 
 @app.post("/callback")
@@ -169,9 +248,12 @@ def handle_message(event):
     
     save_user(user_id)
     reply_text = ""
+    
+    # Log incoming message
+    log_operation(user_id, "received_message", user_msg[:50])
 
     # === MENU 1: คำสั่ง ===
-    if user_msg in ["คำสั่ง", "เมนู", "menu"]:
+    if user_msg in ["คำสั่ง", "เมนู", "menu", "help"]:
         score, learned = get_user_score(user_id)
         reply_text = (f"🤖 คู่มือครูพี่ Bot V2:\n\n"
                       f"1. เริ่มเกม -> เริ่มทายคำศัพท์\n"
@@ -179,18 +261,24 @@ def handle_message(event):
                       f"3. คำใบ้ -> ขอคำใบ้ (ลด -2 คะแนน)\n"
                       f"4. เพิ่ม: [ศัพท์] -> เพิ่มคำใหม่\n"
                       f"5. ลบ: [ศัพท์] -> ลบคำ\n"
-                      f"6. คลัง -> ดูศัพท์ทั้งหมด\n\n"
+                      f"6. คลัง -> ดูศัพท์ทั้งหมด\n"
+                      f"7. สิทธ์ -> ตรวจสอบสิทธิ์\n\n"
                       f"📊 คะแนน: {score} | 📚 จำได้: {len(learned)} คำ")
 
     # === MENU 2: คะแนน ===
-    elif user_msg in ["คะแนน", "score", "สถิติ"]:
+    elif user_msg in ["คะแนน", "score", "สถิติ", "points"]:
         score, learned = get_user_score(user_id)
         reply_text = (f"📊 สถิติความเทพ:\n\n"
                       f"⭐ คะแนนรวม: {score} XP\n"
-                      f"📚 คำศัพท์ที่แม่นแล้ว: {len(learned)} คำ")
+                      f"📚 คำศัพท์ที่แม่นแล้ว: {len(learned)} คำ\n"
+                      f"🎯 เซสชั่นปัจจุบัน: {'มี' if user_id in user_sessions else 'ไม่มี'}")
 
     # === MENU 3: เริ่มเกม ===
-    elif user_msg in ["เริ่มเกม", "เริ่ม", "start", "play"]:
+    elif user_msg in ["เริ่มเกม", "เริ่ม", "start", "play", "quiz"]:
+        # ลบ pending deletion ถ้ามี
+        if user_id in pending_deletions:
+            del pending_deletions[user_id]
+        
         _, learned = get_user_score(user_id)
         selected = get_random_vocab(learned)
         
@@ -212,7 +300,7 @@ def handle_message(event):
                           f"💡 ตอบภาษาไทยมาเลย (ตอบผิดมีเฉลยให้ทันที)")
 
     # === MENU 4: คำใบ้ ===
-    elif user_msg in ["คำใบ้", "hint"]:
+    elif user_msg in ["คำใบ้", "hint", "clue"]:
         if user_id not in user_sessions:
             reply_text = "🤔 ยังไม่ได้เริ่มเกมเลยครับ พิมพ์ 'เริ่มเกม' ก่อนนะ"
         else:
@@ -229,66 +317,221 @@ def handle_message(event):
                               f"ถ้ารู้แล้วพิมพ์ตอบมาเลย!")
 
     # === MENU 5: คลังคำศัพท์ ===
-    elif user_msg in ["คลังคำศัพท์", "คลัง", "vocab"]:
+    elif user_msg in ["คลังคำศัพท์", "คลัง", "vocab", "vocabulary"]:
         try:
-            response = supabase.table("vocab").select("word").order("id", desc=True).limit(20).execute()
+            response = supabase.table("vocab").select("word, meaning").order("id", desc=True).limit(20).execute()
             words = response.data
             if not words:
                 reply_text = "📭 คลังว่างเปล่าครับ"
             else:
-                word_list = "\n".join([f"- {item['word']}" for item in words])
-                reply_text = f"📚 ศัพท์ 20 คำล่าสุด:\n\n{word_list}"
-        except: 
+                word_list = "\n".join([f"- {item['word']}: {item.get('meaning', '')[:30]}..." for item in words])
+                reply_text = f"📚 ศัพท์ 20 คำล่าสุด:\n\n{word_list}\n\n📊 ทั้งหมด: {len(words)} คำ"
+        except Exception as e:
+            logger.error(f"Get vocab list error: {e}")
             reply_text = "⚠️ ดึงข้อมูลไม่ได้ครับ เช็ค DB แป๊บ"
 
-    # === MENU 6: ลบคำศัพท์ ===
-    elif user_msg.startswith(("ลบคำศัพท์:", "ลบ:")):
+    # === MENU 6: ลบคำศัพท์ (แบบยืนยัน 2 ขั้นตอน) ===
+    elif user_msg.startswith(("ลบคำศัพท์:", "ลบ:", "delete:")):
         try:
-            target = user_msg.split(":", 1)[1].strip()
-            if target:
-                supabase.table("vocab").delete().ilike("word", target).execute()
-                reply_text = f"🗑️ ลบ '{target}' เรียบร้อยครับ"
-            else: 
-                reply_text = "อย่าลืมใส่คำที่ต้องการลบหลัง : ด้วยนะครับ"
-        except: 
-            reply_text = "⚠️ ระบบลบมีปัญหา ลองใหม่ครับ"
+            # ตรวจสอบว่าเป็นขั้นตอนยืนยันหรือไม่
+            if user_id in pending_deletions and user_msg.lower() in ["ยืนยัน", "confirm", "yes"]:
+                # ขั้นตอนที่ 2: ยืนยันการลบ
+                word_to_delete = pending_deletions[user_id]
+                
+                # ตรวจสอบสิทธิ์ (เฉพาะ admin หรือคนที่เพิ่มคำนั้น)
+                try:
+                    response = supabase.table("vocab")\
+                        .select("added_by")\
+                        .eq("word", word_to_delete)\
+                        .execute()
+                    
+                    if response.data:
+                        word_info = response.data[0]
+                        # อนุญาตให้ลบเฉพาะคำที่ตัวเองเพิ่ม (หรือ admin)
+                        # สามารถปรับ logic ตามต้องการ
+                        
+                        supabase.table("vocab")\
+                            .delete()\
+                            .eq("word", word_to_delete)\
+                            .execute()
+                        
+                        log_operation(user_id, "delete_word_confirmed", word_to_delete)
+                        reply_text = f"✅ ลบคำว่า '{word_to_delete}' เรียบร้อยแล้ว"
+                    else:
+                        reply_text = f"❌ คำว่า '{word_to_delete}' ไม่พบในระบบแล้ว"
+                        
+                except Exception as e:
+                    logger.error(f"Delete word error: {e}")
+                    reply_text = f"⚠️ ลบคำว่า '{word_to_delete}' ไม่สำเร็จ: {str(e)[:100]}"
+                
+                # ลบ pending deletion
+                del pending_deletions[user_id]
+                
+            else:
+                # ขั้นตอนที่ 1: ระบุคำที่จะลบ
+                parts = user_msg.split(":", 1)
+                if len(parts) < 2:
+                    reply_text = "❌ รูปแบบ: `ลบ: [คำศัพท์]`"
+                else:
+                    target_word = sanitize_word(parts[1].strip())
+                    
+                    if not target_word:
+                        reply_text = "❌ กรุณาระบุคำศัพท์ที่ต้องการลบ"
+                    else:
+                        # ค้นหาคำศัพท์
+                        response = supabase.table("vocab")\
+                            .select("word, meaning, example_sentence")\
+                            .ilike("word", f"%{target_word}%")\
+                            .limit(5)\
+                            .execute()
+                        
+                        found_words = response.data
+                        
+                        if not found_words:
+                            reply_text = f"❌ ไม่พบคำว่า '{target_word}' ในคลังคำศัพท์"
+                        elif len(found_words) == 1:
+                            # พบ 1 คำ ให้ขอ confirm
+                            word_info = found_words[0]
+                            pending_deletions[user_id] = word_info['word']
+                            
+                            reply_text = (f"⚠️ ยืนยันการลบ:\n\n"
+                                        f"📝 คำ: {word_info['word']}\n"
+                                        f"📖 ความหมาย: {word_info.get('meaning', '-')}\n"
+                                        f"🗣️ ตัวอย่าง: {word_info.get('example_sentence', '-')[:50]}...\n\n"
+                                        f"พิมพ์ 'ยืนยัน' เพื่อลบ\n"
+                                        f"พิมพ์อื่นๆ เพื่อยกเลิก")
+                        else:
+                            # พบหลายคำ
+                            word_list = "\n".join([f"{i+1}. {w['word']} - {w.get('meaning', '')[:30]}..." 
+                                                for i, w in enumerate(found_words)])
+                            reply_text = (f"🔍 พบหลายคำที่คล้าย '{target_word}':\n\n"
+                                        f"{word_list}\n\n"
+                                        f"ระบุให้ชัดเจนกว่านี้ เช่น 'ลบ: {found_words[0]['word']}'")
+                        
+        except Exception as e:
+            logger.error(f"Delete word process error: {e}")
+            reply_text = "⚠️ มีปัญหาในการลบ กรุณาลองใหม่ภายหลัง"
 
-    # === MENU 7: เพิ่มคำศัพท์ (ปรับปรุงใหม่ด้วย JSON) ===
+    # === MENU 7: เพิ่มคำศัพท์ ===
     elif user_msg.lower().startswith(("เพิ่ม:", "add:")):
         try:
             word = user_msg.split(":", 1)[1].strip()
-            if word:
-                # Prompt ขอ JSON เพื่อความแม่นยำ
-                prompt = (f"I want to learn the word '{word}'. "
-                          f"Provide the Thai meaning and 1 short English example sentence. "
-                          f"Response strictly in JSON format: "
-                          f'{{"meaning": "...", "example": "..."}}')
-                
-                res = model.generate_content(prompt)
-                
-                # Cleaning JSON string
-                clean_text = res.text.strip().replace("```json", "").replace("```", "")
-                data = json.loads(clean_text)
-
-                meaning = data.get("meaning", "-")
-                example = data.get("example", "-")
-
-                supabase.table("vocab").insert({
-                    "word": word, 
-                    "meaning": meaning, 
-                    "example_sentence": example
-                }).execute()
-                
-                reply_text = f"✅ จดศัพท์ใหม่แล้ว!\n🔤 {word}\n📖 {meaning}\n🗣️ {example}"
-            else: 
+            if not word:
                 reply_text = "ใส่คำศัพท์หลัง : ด้วยนะครับ เช่น 'เพิ่ม: Resilience'"
-        except Exception as e:
-            print(f"Add vocab error: {e}")
-            reply_text = "⚠️ AI งงเล็กน้อย ลองพิมพ์ใหม่อีกรอบครับ เช็คตัวสะกดนิดนึง"
+            else:
+                word = sanitize_word(word)
+                
+                # ตรวจสอบว่ามีอยู่แล้วหรือไม่
+                existing = supabase.table("vocab")\
+                    .select("*")\
+                    .ilike("word", word)\
+                    .execute()
+                
+                if existing.data:
+                    reply_text = f"⚠️ คำว่า '{word}' มีอยู่แล้วในคลัง\nความหมาย: {existing.data[0].get('meaning', '-')}"
+                else:
+                    # Prompt ขอ JSON จาก Gemini
+                    prompt = (f"I want to learn the English word '{word}'. "
+                            f"Provide:\n"
+                            f"1. Thai meaning (short and clear)\n"
+                            f"2. 1 simple English example sentence\n\n"
+                            f"Response in JSON format: "
+                            f'{{"meaning": "Thai meaning here", "example": "Example sentence here"}}')
+                    
+                    res = model.generate_content(prompt)
+                    
+                    # Cleaning JSON string
+                    clean_text = res.text.strip()
+                    if "```json" in clean_text:
+                        clean_text = clean_text.split("```json")[1].split("```")[0]
+                    elif "```" in clean_text:
+                        clean_text = clean_text.split("```")[1].split("```")[0]
+                    
+                    data = json.loads(clean_text)
 
-    # === MENU 8: ตรวจคำตอบ (ปรับปรุงใหม่ ตอบทีเดียวจบ) ===
+                    meaning = data.get("meaning", "-")
+                    example = data.get("example", "-")
+
+                    # บันทึกลงฐานข้อมูล
+                    supabase.table("vocab").insert({
+                        "word": word, 
+                        "meaning": meaning, 
+                        "example_sentence": example,
+                        "added_by": user_id,
+                        "added_at": int(time.time())
+                    }).execute()
+                    
+                    log_operation(user_id, "add_word", word)
+                    reply_text = (f"✅ จดศัพท์ใหม่แล้ว!\n\n"
+                                f"🔤 {word}\n"
+                                f"📖 {meaning}\n"
+                                f"🗣️ {example}")
+                    
+        except json.JSONDecodeError:
+            reply_text = "⚠️ AI ตอบกลับมาไม่ถูกรูปแบบ ลองใหม่อีกครั้งครับ"
+        except Exception as e:
+            logger.error(f"Add vocab error: {e}")
+            reply_text = "⚠️ มีปัญหากับ AI ลองพิมพ์ใหม่อีกรอบครับ"
+
+    # === MENU 8: ตรวจสอบสิทธิ์ ===
+    elif user_msg in ["สิทธ์", "สิทธิ์", "สิทธิ", "role", "admin"]:
+        # ตรวจสอบว่าเป็น admin หรือไม่ (ปรับ user_id ตามต้องการ)
+        admin_users = ["U1234567890abcdef1234567890abcdef"]  # เปลี่ยนเป็น ID จริงของคุณ
+        
+        if user_id in admin_users:
+            reply_text = "👑 คุณคือ Admin!\nสามารถใช้งานทุกคำสั่งได้"
+        else:
+            reply_text = "👤 คุณคือ User ปกติ\nสามารถใช้งานคำสั่งพื้นฐานได้"
+
+    # === MENU 9: ตรวจสอบระบบ (สำหรับ Admin) ===
+    elif user_msg == "ตรวจสอบระบบ":
+        admin_users = ["U1234567890abcdef1234567890abcdef"]  # เปลี่ยนเป็น ID จริง
+        
+        if user_id in admin_users:
+            try:
+                # นับจำนวนคำศัพท์
+                vocab_result = supabase.table("vocab").select("*", count="exact").execute()
+                vocab_count = vocab_result.count or 0
+                
+                # นับผู้ใช้
+                user_result = supabase.table("users").select("*", count="exact").execute()
+                user_count = user_result.count or 0
+                
+                # ตรวจสอบ sessions
+                active_sessions = len(user_sessions)
+                
+                reply_text = (f"📊 สถิติระบบ:\n\n"
+                            f"🗃️ คำศัพท์ทั้งหมด: {vocab_count} คำ\n"
+                            f"👥 ผู้ใช้ทั้งหมด: {user_count} คน\n"
+                            f"🎮 เซสชั่นปัจจุบัน: {active_sessions}\n"
+                            f"⏰ เวลาปัจจุบัน: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            except Exception as e:
+                logger.error(f"System check error: {e}")
+                reply_text = f"⚠️ ตรวจสอบระบบผิดพลาด: {str(e)[:100]}"
+        else:
+            reply_text = "❌ คำสั่งนี้สำหรับ Admin เท่านั้น"
+
+    # === MENU 10: ยกเลิก ===
+    elif user_msg in ["ยกเลิก", "cancel", "stop"]:
+        if user_id in pending_deletions:
+            word = pending_deletions[user_id]
+            del pending_deletions[user_id]
+            reply_text = f"✅ ยกเลิกการลบคำว่า '{word}' แล้ว"
+        elif user_id in user_sessions:
+            del user_sessions[user_id]
+            reply_text = "✅ ยกเลิกเกมปัจจุบันแล้ว"
+        else:
+            reply_text = "🤔 ไม่มีอะไรให้ยกเลิกครับ"
+
+    # === DEFAULT: ตรวจคำตอบ (ปรับปรุงใหม่ ตอบทีเดียวจบ) ===
     else:
-        if user_id not in user_sessions:
+        if user_id in pending_deletions:
+            # ถ้ามี pending deletion แต่พิมพ์คำอื่น นั่นคือยกเลิก
+            word = pending_deletions[user_id]
+            del pending_deletions[user_id]
+            reply_text = f"❌ ยกเลิกการลบคำว่า '{word}' เพราะคุณพิมพ์: '{user_msg}'"
+            
+        elif user_id not in user_sessions:
             reply_text = "🤔 อยากเล่นเกมพิมพ์ 'เริ่มเกม' ได้เลยครับ\nหรือพิมพ์ 'คำสั่ง' เพื่อดูเมนู"
         else:
             session = user_sessions[user_id]
@@ -296,19 +539,25 @@ def handle_message(event):
             correct_meaning = session['meaning']
             
             try:
-                # Prompt ชุดเดียว ได้ครบทุกอย่าง (ตรวจ, เหตุผล, ตัวอย่าง)
-                prompt = (f"User is learning vocabulary. Word: '{word}' (Meaning: {correct_meaning}).\n"
-                          f"User answered: '{user_msg}'\n\n"
-                          f"1. Check if the answer is correct (accept synonyms).\n"
-                          f"2. Explain why in Thai (short and encouraging).\n"
-                          f"3. Create 3 distinct, simple English example sentences using '{word}'.\n\n"
-                          f"Response strictly in JSON format:\n"
-                          f'{{"is_correct": boolean, "reason_thai": "...", "examples": ["Ex1", "Ex2", "Ex3"]}}')
+                # Prompt ชุดเดียว ได้ครบทุกอย่าง
+                prompt = (f"User is learning vocabulary. Word: '{word}' (Correct meaning: {correct_meaning}).\n"
+                         f"User answered: '{user_msg}'\n\n"
+                         f"Analyze and respond with:\n"
+                         f"1. is_correct: true/false (accept synonyms and similar meanings)\n"
+                         f"2. reason_thai: short explanation in Thai (friendly tone)\n"
+                         f"3. examples: 3 simple English example sentences\n\n"
+                         f"Response in strict JSON format only:\n"
+                         f'{{"is_correct": boolean, "reason_thai": "...", "examples": ["Ex1", "Ex2", "Ex3"]}}')
                 
                 res = model.generate_content(prompt)
                 
                 # Cleaning & Parsing
-                clean_text = res.text.strip().replace("```json", "").replace("```", "")
+                clean_text = res.text.strip()
+                if "```json" in clean_text:
+                    clean_text = clean_text.split("```json")[1].split("```")[0]
+                elif "```" in clean_text:
+                    clean_text = clean_text.split("```")[1].split("```")[0]
+                
                 result = json.loads(clean_text)
                 
                 is_correct = result.get("is_correct", False)
@@ -316,7 +565,7 @@ def handle_message(event):
                 examples = result.get("examples", [])
                 
                 # จัด Format ตัวอย่างประโยค
-                example_txt = "\n".join([f"• {ex}" for ex in examples])
+                example_txt = "\n".join([f"• {ex}" for ex in examples]) if examples else "ไม่มีตัวอย่าง"
 
                 # ล้าง Session ทันที (One-shot Logic)
                 del user_sessions[user_id]
@@ -327,27 +576,80 @@ def handle_message(event):
                     mark_word_learned(user_id, word)
                     
                     reply_text = (f"🎉 สุดยอด! ถูกต้องครับ (+10 คะแนน)\n\n"
-                                  f"💬 {reason}\n"
-                                  f"📊 คะแนนรวม: {new_score}\n\n"
-                                  f"🌟 ตัวอย่างการใช้:\n{example_txt}\n\n"
-                                  f"👉 พิมพ์ 'เริ่มเกม' เพื่อลุยข้อต่อไป!")
+                                 f"💬 {reason}\n\n"
+                                 f"📊 คะแนนรวม: {new_score}\n\n"
+                                 f"🌟 ตัวอย่างการใช้:\n{example_txt}\n\n"
+                                 f"👉 พิมพ์ 'เริ่มเกม' เพื่อลุยข้อต่อไป!")
                 else:
                     # ❌ ผิด (เฉลยเลย)
                     new_score = update_score(user_id, -2)
                     
                     reply_text = (f"❌ ยังไม่ใช่นะครับ (-2 คะแนน)\n\n"
-                                  f"📖 เฉลย: {word} แปลว่า \"{correct_meaning}\"\n"
-                                  f"💡 คำแนะนำ: {reason}\n\n"
-                                  f"🌟 ดูตัวอย่างประโยคช่วยจำ:\n{example_txt}\n\n"
-                                  f"ไม่ต้องซีเรียสครับ พิมพ์ 'เริ่มเกม' ลองคำใหม่เลย!")
+                                 f"📖 เฉลย: {word} แปลว่า \"{correct_meaning}\"\n"
+                                 f"💡 คำแนะนำ: {reason}\n\n"
+                                 f"🌟 ดูตัวอย่างประโยคช่วยจำ:\n{example_txt}\n\n"
+                                 f"ไม่ต้องซีเรียสครับ พิมพ์ 'เริ่มเกม' ลองคำใหม่เลย!")
+                
+                log_operation(user_id, "check_answer", f"word:{word}, correct:{is_correct}")
             
+            except json.JSONDecodeError:
+                reply_text = f"⚠️ AI ตอบกลับมาไม่ถูกรูปแบบ\n\nเฉลย: {word} แปลว่า \"{correct_meaning}\"\n\nลองตอบใหม่อีกครั้ง!"
+                # ไม่ลบ session ให้ลองใหม่
+                if user_id not in user_sessions:
+                    user_sessions[user_id] = session
             except Exception as e:
-                print(f"Check answer error: {e}")
-                reply_text = "😵‍💫 ระบบประมวลผลผิดพลาด ลองตอบใหม่อีกทีนะครับ"
+                logger.error(f"Check answer error: {e}")
+                reply_text = f"😵‍💫 ระบบประมวลผลผิดพลาด\n\nเฉลย: {word} แปลว่า \"{correct_meaning}\"\n\nลองตอบใหม่อีกทีนะครับ"
+                # ไม่ลบ session ให้ลองใหม่
+                if user_id not in user_sessions:
+                    user_sessions[user_id] = session
 
     # ส่งข้อความกลับ Line
     if reply_text:
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+            log_operation(user_id, "reply_sent", reply_text[:50])
         except Exception as e:
+            logger.error(f"LINE Reply Error: {e}")
             print(f"LINE Reply Error: {e}")
+
+# --- 5. ADDITIONAL ENDPOINTS ---
+@app.get("/stats")
+def get_stats():
+    """Get system statistics"""
+    try:
+        vocab_count = supabase.table("vocab").select("*", count="exact").execute().count
+        user_count = supabase.table("users").select("*", count="exact").execute().count
+        active_sessions = len(user_sessions)
+        
+        return {
+            "status": "ok",
+            "vocabulary_count": vocab_count,
+            "user_count": user_count,
+            "active_sessions": active_sessions,
+            "pending_deletions": len(pending_deletions),
+            "timestamp": time.time()
+        }
+    except Exception as e:
+        logger.error(f"Get stats error: {e}")
+        return {"status": "error", "detail": str(e)}
+
+@app.get("/reset/{user_id}")
+def reset_user(user_id: str):
+    """Reset user data (for testing)"""
+    try:
+        # ลบ session
+        if user_id in user_sessions:
+            del user_sessions[user_id]
+        
+        if user_id in pending_deletions:
+            del pending_deletions[user_id]
+        
+        return {"status": "ok", "message": f"Reset user {user_id}"}
+    except Exception as e:
+        return {"status": "error", "detail": str(e)}
+
+# Run the app
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)
