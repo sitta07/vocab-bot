@@ -1,5 +1,6 @@
 import os
 import random
+import re
 import google.generativeai as genai
 from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookHandler
@@ -29,7 +30,6 @@ line_bot_api = LineBotApi(LINE_ACCESS_TOKEN)
 handler = WebhookHandler(LINE_SECRET)
 
 # 🔥 GEMINI CONFIG (WITH SAFETY SETTINGS)
-# ปลดล็อก Safety Filter เพื่อกัน AI บล็อกคำตอบตัวเอง (แก้ปัญหา ValueError)
 genai.configure(api_key=GEMINI_API_KEY)
 safety_settings = [
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -46,8 +46,6 @@ except Exception as e:
     print(f"Supabase Connection Error: {e}")
 
 # 🔥 GLOBAL STATE (RAM)
-# ใช้เก็บ Attempt count ชั่วคราว (Restart แล้วหาย)
-# Structure: { 'UserId...': {'attempts': 0, 'current_word': 'cat'} }
 user_sessions = {}
 
 # --- 2. HELPER FUNCTIONS ---
@@ -56,6 +54,18 @@ def save_user(user_id):
     try:
         supabase.table("users").upsert({"user_id": user_id}, on_conflict="user_id").execute()
     except: pass
+
+def is_english_sentence(text):
+    """เช็คว่าเป็นภาษาอังกฤษแบบง่ายๆ โดยไม่เรียก AI"""
+    # เช็คว่ามีตัวอักษรภาษาอังกฤษมากกว่า 70%
+    english_chars = sum(1 for c in text if c.isalpha() and ord(c) < 128)
+    total_chars = sum(1 for c in text if c.isalpha())
+    
+    if total_chars == 0:
+        return False
+    
+    english_ratio = english_chars / total_chars
+    return english_ratio > 0.7
 
 # --- 3. API ENDPOINTS ---
 @app.get("/")
@@ -157,124 +167,125 @@ def handle_message(event):
                 supabase.table("vocab").insert({"word": word, "meaning": meaning, "example_sentence": example}).execute()
                 reply_text = f"✅ จดแล้ว!\n🔤 {word}\n📖 {meaning}\n🗣️ {example}"
             else: reply_text = "ใส่คำศัพท์หลัง : ด้วยนะครับ"
-        except: reply_text = "⚠️ AI กำลังมึน ลองใหม่ครับ"
+        except Exception as e:
+            print(f"Add vocab error: {e}")
+            reply_text = "⚠️ AI กำลังมึน ลองใหม่ครับ"
 
-    # === MENU 5: ตรวจการบ้าน (Robust + Strict + Retry) ===
+    # === MENU 5: ตรวจการบ้าน (ลด AI Call) ===
     else:
-        # 🔥 STEP 1: กรองข้อความที่ไม่ใช่ประโยคภาษาอังกฤษ
-        if len(user_msg) < 5 or not any(c.isalpha() for c in user_msg):
+        # 🔥 STEP 1: กรองข้อความที่ไม่ใช่ประโยคภาษาอังกฤษ (ไม่เรียก AI)
+        if len(user_msg) < 5 or not is_english_sentence(user_msg):
             reply_text = "🤔 ส่งประโยคภาษาอังกฤษมาให้ครูตรวจนะครับ\n(หรือพิมพ์ 'คำสั่ง' ดูเมนู)"
         else:
             try:
-                # 🔥 STEP 2: ตรวจสอบว่าเป็นภาษาอังกฤษก่อน
-                check_prompt = f"Is this English sentence? Answer ONLY 'Yes' or 'No': '{user_msg}'"
-                check_res = model.generate_content(check_prompt)
-                is_english = "yes" in check_res.text.lower()
+                # 🔥 STEP 2: ดึง Session
+                session = user_sessions.get(user_id, {'attempts': 0, 'current_word': None})
                 
-                if not is_english:
-                    reply_text = "📝 นี่ดูไม่ค่อยเป็นประโยคภาษาอังกฤษนะครับ\nลองส่งใหม่ หรือพิมพ์ 'คำสั่ง' ดูวิธีใช้งาน"
-                else:
-                    # 🔥 STEP 3: ดึง Session + เช็คว่ากำลังทำโจทย์คำเดียวกันไหม
-                    session = user_sessions.get(user_id, {'attempts': 0, 'current_word': None})
+                # 🔥 STEP 3: ตรวจประโยคเลย (รวมหาคำ+ตรวจในครั้งเดียว - ประหยัด API Call)
+                prompt = (f"Task: Grade this English sentence as a strict teacher.\n"
+                          f"Sentence: '{user_msg}'\n\n"
+                          f"RULES:\n"
+                          f"1. Grammar wrong? → Pass: No\n"
+                          f"2. Too short (under 6 words) OR too simple? → Pass: No\n"
+                          f"3. Correct + detailed (6+ words, good grammar)? → Pass: Yes\n\n"
+                          f"OUTPUT FORMAT (MUST follow exactly):\n"
+                          f"Word: [extract main vocabulary word - ONE word only]\n"
+                          f"Pass: [Yes or No]\n"
+                          f"Reason: [Thai explanation, 1 short line]\n"
+                          f"Feedback: [Thai suggestion, 1 line]\n"
+                          f"Better: [Corrected English sentence]\n\n"
+                          f"Be strict but fair. Extract the key vocabulary word being practiced.")
+                
+                res = model.generate_content(prompt)
+                
+                # กัน ValueError
+                try:
+                    ai_text = res.text.strip()
+                except ValueError:
+                    ai_text = "Pass: No\nReason: AI ไม่สามารถประมวลผลได้\nFeedback: ลองส่งประโยคใหม่ครับ\nBetter: -\nWord: unknown"
+                except Exception as e:
+                    print(f"AI Response Error: {e}")
+                    ai_text = "Pass: No\nReason: เกิดข้อผิดพลาด\nFeedback: ลองใหม่อีกครั้งครับ\nBetter: -\nWord: unknown"
+
+                # Parse AI Response
+                detected_word = "unknown"
+                is_pass = False
+                reason = "ไม่ระบุสาเหตุ"
+                feedback = "ลองปรับปรุงดูนะครับ"
+                better_ver = "No suggestion"
+
+                for line in ai_text.split('\n'):
+                    line = line.strip()
+                    if line.startswith("Word:"): 
+                        detected_word = line.replace("Word:", "").strip().split()[0].lower()
+                    elif line.startswith("Pass:"): 
+                        is_pass = "yes" in line.lower()
+                    elif line.startswith("Reason:"): 
+                        reason = line.replace("Reason:", "").strip()
+                    elif line.startswith("Feedback:"): 
+                        feedback = line.replace("Feedback:", "").strip()
+                    elif line.startswith("Better:"): 
+                        better_ver = line.replace("Better:", "").strip()
+
+                # 🔥 STEP 4: เช็ค Session (ถ้าเปลี่ยนคำ -> reset)
+                if session['current_word'] is None or session['current_word'].lower() != detected_word:
+                    session = {'attempts': 0, 'current_word': detected_word}
+                
+                current_attempt = session['attempts'] + 1
+
+                # 🔥 STEP 5: ตัดสินผล
+                if is_pass:
+                    # ✅ ผ่าน -> ล้าง session
+                    if user_id in user_sessions: 
+                        del user_sessions[user_id]
                     
-                    # หา Main Word จากประโยค
-                    word_detect_prompt = f"Extract the main vocabulary word from: '{user_msg}'. Answer with ONE word only."
-                    word_res = model.generate_content(word_detect_prompt)
-                    detected_word = word_res.text.strip().split()[0].lower()
+                    reply_text = (f"🎉 ยอดเยี่ยม! ผ่านเลย\n"
+                                  f"📌 ศัพท์: {detected_word}\n"
+                                  f"✅ {reason}\n\n"
+                                  f"💬 ตัวอย่างที่ดี:\n\"{better_ver}\"")
                     
-                    # ถ้า session ว่าง หรือเปลี่ยนคำ -> reset
-                    if session['current_word'] is None or session['current_word'].lower() != detected_word:
-                        session = {'attempts': 0, 'current_word': detected_word}
-                    
-                    current_attempt = session['attempts'] + 1
-                    
-                    # 🔥 STEP 4: ตรวจประโยค (PROMPT ชัดเจนขึ้น)
-                    prompt = (f"Sentence: '{user_msg}'\n"
-                              f"Task: Grade as strict English teacher.\n\n"
-                              f"RULES:\n"
-                              f"1. Grammar wrong? → Pass: No\n"
-                              f"2. Too short/simple? (under 6 words OR lacks detail) → Pass: No\n"
-                              f"3. Correct + detailed (7+ words, clear meaning)? → Pass: Yes\n\n"
-                              f"OUTPUT (strict format):\n"
-                              f"Word: [main word]\n"
-                              f"Pass: [Yes or No]\n"
-                              f"Reason: [Thai explanation in 1 line]\n"
-                              f"Feedback: [Thai suggestion]\n"
-                              f"Better: [Corrected English sentence]")
-                    
-                    res = model.generate_content(prompt)
-                    
-                    # กัน ValueError
+                    # บันทึก Log
                     try:
-                        ai_text = res.text.strip()
-                    except ValueError:
-                        ai_text = "Pass: No\nReason: AI ประมวลผลไม่ได้\nFeedback: ลองใหม่ครับ\nBetter: -"
+                        v_data = supabase.table("vocab").select("id").ilike("word", detected_word).limit(1).execute().data
+                        if v_data:
+                            supabase.table("user_logs").insert({
+                                "user_id": user_id, 
+                                "vocab_id": v_data[0]['id'], 
+                                "user_answer": user_msg, 
+                                "is_correct": True
+                            }).execute()
+                    except: 
+                        pass
 
-                    # Parse AI Response
-                    is_pass = False
-                    reason = "ไม่ระบุสาเหตุ"
-                    feedback = "ลองปรับปรุงดูนะครับ"
-                    better_ver = "No suggestion"
-
-                    for line in ai_text.split('\n'):
-                        line = line.strip()
-                        if line.startswith("Pass:"): 
-                            is_pass = "yes" in line.lower()
-                        elif line.startswith("Reason:"): 
-                            reason = line.replace("Reason:", "").strip()
-                        elif line.startswith("Feedback:"): 
-                            feedback = line.replace("Feedback:", "").strip()
-                        elif line.startswith("Better:"): 
-                            better_ver = line.replace("Better:", "").strip()
-
-                    # 🔥 STEP 5: ตัดสินผล
-                    if is_pass:
-                        # ✅ ผ่าน -> ล้าง session
+                else:
+                    # ❌ ไม่ผ่าน
+                    if current_attempt < 3:
+                        # ยังแก้ได้
+                        session['attempts'] = current_attempt
+                        user_sessions[user_id] = session
+                        
+                        reply_text = (f"🤔 ยังไม่ผ่านนะครับ (พยายามครั้งที่ {current_attempt}/3)\n\n"
+                                      f"❌ ปัญหา: {reason}\n"
+                                      f"💡 คำแนะนำ: {feedback}\n\n"
+                                      f"👉 ลองแก้ไขแล้วส่งใหม่ สู้ๆ!")
+                    else:
+                        # ครบ 3 ครั้ง -> เฉลย + ล้าง session
                         if user_id in user_sessions: 
                             del user_sessions[user_id]
                         
-                        reply_text = (f"🎉 ยอดเยี่ยม! ผ่านเลย\n"
-                                      f"📌 ศัพท์: {detected_word}\n"
-                                      f"✅ {reason}\n\n"
-                                      f"💬 ตัวอย่างที่ดี:\n\"{better_ver}\"")
-                        
-                        # บันทึก Log (Optional)
-                        try:
-                            v_data = supabase.table("vocab").select("id").ilike("word", detected_word).limit(1).execute().data
-                            if v_data:
-                                supabase.table("user_logs").insert({
-                                    "user_id": user_id, 
-                                    "vocab_id": v_data[0]['id'], 
-                                    "user_answer": user_msg, 
-                                    "is_correct": True
-                                }).execute()
-                        except: 
-                            pass
-
-                    else:
-                        # ❌ ไม่ผ่าน
-                        if current_attempt < 3:
-                            # ยังแก้ได้
-                            session['attempts'] = current_attempt
-                            user_sessions[user_id] = session
-                            
-                            reply_text = (f"🤔 ยังไม่ผ่านนะครับ (พยายามครั้งที่ {current_attempt}/3)\n\n"
-                                          f"❌ ปัญหา: {reason}\n"
-                                          f"💡 คำแนะนำ: {feedback}\n\n"
-                                          f"👉 ลองแก้ไขแล้วส่งใหม่ สู้ๆ!")
-                        else:
-                            # ครบ 3 ครั้ง -> เฉลย + ล้าง session
-                            if user_id in user_sessions: 
-                                del user_sessions[user_id]
-                            
-                            reply_text = (f"❌ ครบ 3 ครั้งแล้วครับ\n\n"
-                                          f"📝 ปัญหาหลัก: {reason}\n"
-                                          f"🔑 ตัวอย่างที่ถูกต้อง:\n\"{better_ver}\"\n\n"
-                                          f"💪 จำไว้นะครับ ครั้งหน้าต้องทำได้แน่!")
+                        reply_text = (f"❌ ครบ 3 ครั้งแล้วครับ\n\n"
+                                      f"📝 ปัญหาหลัก: {reason}\n"
+                                      f"🔑 ตัวอย่างที่ถูกต้อง:\n\"{better_ver}\"\n\n"
+                                      f"💪 จำไว้นะครับ ครั้งหน้าต้องทำได้แน่!")
 
             except Exception as e:
-                print(f"❌ System Error: {e}")
-                reply_text = "😵‍💫 ระบบขัดข้องชั่วคราว รอสักครู่แล้วลองใหม่นะครับ"
+                print(f"❌ System Error in homework check: {e}")
+                import traceback
+                traceback.print_exc()
+                reply_text = "😵‍💫 ระบบขัดข้องชั่วคราว ลองส่งใหม่อีกทีนะครับ\n(หรือพิมพ์ 'คำสั่ง' ดูเมนู)"
 
     if reply_text:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        try:
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
+        except Exception as e:
+            print(f"LINE Reply Error: {e}")
