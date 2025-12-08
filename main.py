@@ -296,54 +296,74 @@ def handle_message(event):
             correct_meaning = session['meaning']
             
             try:
-                # Prompt ชุดเดียว ได้ครบทุกอย่าง (ตรวจ, เหตุผล, ตัวอย่าง)
-                prompt = (f"User is learning vocabulary. Word: '{word}' (Meaning: {correct_meaning}).\n"
-                          f"User answered: '{user_msg}'\n\n"
-                          f"1. Check if the answer is correct (accept synonyms).\n"
-                          f"2. Explain why in Thai (short and encouraging).\n"
-                          f"3. Create 3 distinct, simple English example sentences using '{word}'.\n\n"
-                          f"Response strictly in JSON format:\n"
-                          f'{{"is_correct": boolean, "reason_thai": "...", "examples": ["Ex1", "Ex2", "Ex3"]}}')
+                # เพิ่มความยืดหยุ่นในการตรวจคำตอบ ยอมรับ synonym และคำตอบใกล้เคียง
+                prompt = (f"Word: '{word}' (Correct meaning: {correct_meaning})\n"
+                        f"User's answer: '{user_msg}'\n\n"
+                        f"Task:\n"
+                        f"1. Check if the user's answer is CORRECT (be flexible - accept synonyms, similar meanings, or partially correct answers if the main idea matches)\n"
+                        f"2. If incorrect, suggest how to improve in Thai (friendly tone)\n"
+                        f"3. Provide 2 simple example sentences in English\n\n"
+                        f"Respond in STRICT JSON format:\n"
+                        f'{{"is_correct": true/false, "feedback": "brief feedback in Thai", "examples": ["example1", "example2"]}}')
                 
                 res = model.generate_content(prompt)
                 
-                # Cleaning & Parsing
-                clean_text = res.text.strip().replace("```json", "").replace("```", "")
-                result = json.loads(clean_text)
+                # Improved parsing with fallbacks
+                try:
+                    clean_text = res.text.strip()
+                    if "```json" in clean_text:
+                        clean_text = clean_text.split("```json")[1].split("```")[0].strip()
+                    elif "```" in clean_text:
+                        clean_text = clean_text.split("```")[1].split("```")[0].strip()
+                    
+                    result = json.loads(clean_text)
+                except:
+                    # Fallback: try to extract JSON-like string
+                    import re
+                    json_match = re.search(r'\{.*\}', clean_text, re.DOTALL)
+                    if json_match:
+                        result = json.loads(json_match.group())
+                    else:
+                        # ถ้าไม่สามารถ parse ได้ ให้ถือว่าตอบผิด
+                        result = {"is_correct": False, "feedback": "ลองใหม่อีกครั้งนะครับ", "examples": []}
                 
                 is_correct = result.get("is_correct", False)
-                reason = result.get("reason_thai", "ไม่มีคำอธิบาย")
+                feedback = result.get("feedback", "ไม่มีคำติชม")
                 examples = result.get("examples", [])
                 
-                # จัด Format ตัวอย่างประโยค
-                example_txt = "\n".join([f"• {ex}" for ex in examples])
-
-                # ล้าง Session ทันที (One-shot Logic)
+                # จัดรูปแบบตัวอย่าง
+                example_txt = ""
+                if examples:
+                    example_txt = "\n" + "\n".join([f"• {ex}" for ex in examples])
+                
+                # ล้าง session
                 del user_sessions[user_id]
 
                 if is_correct:
-                    # ✅ ถูกต้อง
+                    # ✅ ถูกต้อง - ให้คะแนน
                     new_score = update_score(user_id, 10)
                     mark_word_learned(user_id, word)
                     
-                    reply_text = (f"🎉 สุดยอด! ถูกต้องครับ (+10 คะแนน)\n\n"
-                                  f"💬 {reason}\n"
-                                  f"📊 คะแนนรวม: {new_score}\n\n"
-                                  f"🌟 ตัวอย่างการใช้:\n{example_txt}\n\n"
-                                  f"👉 พิมพ์ 'เริ่มเกม' เพื่อลุยข้อต่อไป!")
+                    reply_text = (f"🎉 ถูกต้องเลย! (+10 คะแนน)\n\n"
+                                f"💬 {feedback}\n"
+                                f"📊 คะแนนรวมตอนนี้: {new_score}\n"
+                                f"{example_txt}\n\n"
+                                f"👉 พิมพ์ 'เริ่มเกม' เพื่อเล่นต่อ หรือ 'คะแนน' เพื่อดูสถิติ")
                 else:
-                    # ❌ ผิด (เฉลยเลย)
-                    new_score = update_score(user_id, -2)
+                    # ❌ ผิด - ไม่ต้องหักคะแนนมากเกินไป
+                    new_score = update_score(user_id, -1)  # ลดการหักคะแนน
                     
-                    reply_text = (f"❌ ยังไม่ใช่นะครับ (-2 คะแนน)\n\n"
-                                  f"📖 เฉลย: {word} แปลว่า \"{correct_meaning}\"\n"
-                                  f"💡 คำแนะนำ: {reason}\n\n"
-                                  f"🌟 ดูตัวอย่างประโยคช่วยจำ:\n{example_txt}\n\n"
-                                  f"ไม่ต้องซีเรียสครับ พิมพ์ 'เริ่มเกม' ลองคำใหม่เลย!")
+                    reply_text = (f"❌ คำตอบยังไม่ถูกต้องครับ (-1 คะแนน)\n\n"
+                                f"📖 คำที่ถูกต้อง: {word} → \"{correct_meaning}\"\n"
+                                f"💡 คำแนะนำ: {feedback}\n"
+                                f"{example_txt}\n\n"
+                                f"📊 คะแนนรวม: {new_score}\n"
+                                f"ไม่เป็นไรครับ! พิมพ์ 'เริ่มเกม' เพื่อลองคำใหม่ได้เลย")
             
             except Exception as e:
-                print(f"Check answer error: {e}")
-                reply_text = e 
+                print(f"Error checking answer: {e}")
+                # แสดงเฉลยเมื่อมี error
+                reply_text = f"ขออภัยครับ ระบบมีปัญหา\n📖 คำนี้คือ: {word} → \"{correct_meaning}\"\n\nพิมพ์ 'เริ่มเกม' เพื่อเล่นต่อนะครับ"
 
     # ส่งข้อความกลับ Line
     if reply_text:
