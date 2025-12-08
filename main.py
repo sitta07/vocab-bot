@@ -1,5 +1,6 @@
 import os
 import random
+import json
 import google.generativeai as genai
 from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookHandler
@@ -30,13 +31,8 @@ handler = WebhookHandler(LINE_SECRET)
 
 # 🔥 GEMINI CONFIG
 genai.configure(api_key=GEMINI_API_KEY)
-safety_settings = [
-    {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
-    {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
-]
-model = genai.GenerativeModel('gemini-flash-latest', safety_settings=safety_settings)
+# ปรับ model เป็น flash เพื่อความไวและประหยัด
+model = genai.GenerativeModel('gemini-1.5-flash') 
 
 # Setup Supabase
 try:
@@ -45,7 +41,8 @@ except Exception as e:
     print(f"Supabase Connection Error: {e}")
 
 # 🔥 GLOBAL STATE (RAM)
-# Structure: { 'user_id': {'word': 'revise', 'meaning': '...', 'attempts': 0, 'hint_given': False} }
+# Structure: { 'user_id': {'word': 'revise', 'meaning': '...'} }
+# ตัด attempts ออกเพราะใช้ logic ตอบรอบเดียวจบ
 user_sessions = {}
 
 # --- 2. HELPER FUNCTIONS ---
@@ -66,7 +63,7 @@ def get_user_score(user_id):
         return 0, []
 
 def update_score(user_id, points):
-    """เพิ่มคะแนน"""
+    """เพิ่ม/ลดคะแนน"""
     try:
         score, learned = get_user_score(user_id)
         new_score = score + points
@@ -114,7 +111,7 @@ def get_random_vocab(exclude_words=[]):
 # --- 3. API ENDPOINTS ---
 @app.get("/")
 def health_check():
-    return {"status": "ok", "msg": "Teacher Bot is ready!"}
+    return {"status": "ok", "msg": "Teacher Bot V2 (Senior Logic) is ready!"}
 
 @app.get("/broadcast-quiz")
 def broadcast_quiz():
@@ -135,18 +132,16 @@ def broadcast_quiz():
             word = selected['word']
             meaning = selected.get('meaning', '-')
 
-            msg = (f"🔥 ภารกิจประลองปัญญา!\n\n"
+            msg = (f"🔥 ภารกิจมาแล้ว!\n\n"
                    f"❓ คำว่า '{word}' แปลว่าอะไร?\n\n"
-                   f"💡 พิมพ์คำตอบมาเลย (ภาษาไทย)")
+                   f"💡 ตอบผิดไม่เป็นไร เดี๋ยวมีเฉลยพร้อมตัวอย่างให้ครับ")
 
             try:
                 line_bot_api.push_message(user_id, TextSendMessage(text=msg))
-                # เก็บ session
+                # เก็บ session (ไม่ต้องมี attempts แล้ว)
                 user_sessions[user_id] = {
                     'word': word,
-                    'meaning': meaning,
-                    'attempts': 0,
-                    'hint_given': False
+                    'meaning': meaning
                 }
             except: 
                 continue 
@@ -177,23 +172,21 @@ def handle_message(event):
     # === MENU 1: คำสั่ง ===
     if user_msg in ["คำสั่ง", "เมนู", "menu"]:
         score, learned = get_user_score(user_id)
-        reply_text = (f"🤖 คู่มือครูพี่ Bot:\n\n"
+        reply_text = (f"🤖 คู่มือครูพี่ Bot V2:\n\n"
                       f"1. เริ่มเกม -> เริ่มทายคำศัพท์\n"
-                      f"2. คะแนน -> ดูคะแนนและสถิติ\n"
-                      f"3. คำใบ้ -> ขอคำใบ้ (ลดคะแนน -2)\n"
+                      f"2. คะแนน -> ดูคะแนน\n"
+                      f"3. คำใบ้ -> ขอคำใบ้ (ลด -2 คะแนน)\n"
                       f"4. เพิ่ม: [ศัพท์] -> เพิ่มคำใหม่\n"
-                      f"5. ลบคำศัพท์: [ศัพท์] -> ลบคำ\n"
-                      f"6. คลังคำศัพท์ -> ดูทั้งหมด\n\n"
-                      f"📊 คะแนนปัจจุบัน: {score} คะแนน\n"
-                      f"📚 เรียนไปแล้ว: {len(learned)} คำ")
+                      f"5. ลบ: [ศัพท์] -> ลบคำ\n"
+                      f"6. คลัง -> ดูศัพท์ทั้งหมด\n\n"
+                      f"📊 คะแนน: {score} | 📚 จำได้: {len(learned)} คำ")
 
     # === MENU 2: คะแนน ===
     elif user_msg in ["คะแนน", "score", "สถิติ"]:
         score, learned = get_user_score(user_id)
-        reply_text = (f"📊 สถิติของคุณ:\n\n"
-                      f"⭐ คะแนนรวม: {score} คะแนน\n"
-                      f"📚 จำนวนคำที่เรียน: {len(learned)} คำ\n"
-                      f"🎯 อัตราความสำเร็จ: {len(learned)*100//max(len(learned)+1,1)}%")
+        reply_text = (f"📊 สถิติความเทพ:\n\n"
+                      f"⭐ คะแนนรวม: {score} XP\n"
+                      f"📚 คำศัพท์ที่แม่นแล้ว: {len(learned)} คำ")
 
     # === MENU 3: เริ่มเกม ===
     elif user_msg in ["เริ่มเกม", "เริ่ม", "start", "play"]:
@@ -201,40 +194,38 @@ def handle_message(event):
         selected = get_random_vocab(learned)
         
         if not selected:
-            reply_text = "📭 คลังศัพท์ว่างเปล่า ใช้คำสั่ง 'เพิ่ม: [คำศัพท์]' เพื่อเพิ่มคำใหม่"
+            reply_text = "📭 คลังศัพท์ว่างเปล่า! พิมพ์ 'เพิ่ม: [คำศัพท์]' เพื่อใส่คำใหม่ก่อนครับ"
         else:
             word = selected['word']
             meaning = selected.get('meaning', '-')
             
+            # Reset Session ใหม่
             user_sessions[user_id] = {
                 'word': word,
                 'meaning': meaning,
-                'attempts': 0,
                 'hint_given': False
             }
             
-            reply_text = (f"🎮 เกมเริ่มแล้ว!\n\n"
+            reply_text = (f"🎮 เริ่มกันเลย!\n\n"
                           f"❓ คำว่า '{word}' แปลว่าอะไร?\n\n"
-                          f"💡 พิมพ์คำตอบเป็นภาษาไทย\n"
-                          f"🆘 พิมพ์ 'คำใบ้' หากต้องการความช่วยเหลือ")
+                          f"💡 ตอบภาษาไทยมาเลย (ตอบผิดมีเฉลยให้ทันที)")
 
     # === MENU 4: คำใบ้ ===
-    elif user_msg in ["คำใบ้", "hint", "help"]:
+    elif user_msg in ["คำใบ้", "hint"]:
         if user_id not in user_sessions:
-            reply_text = "🤔 ยังไม่มีเกมที่กำลังเล่น พิมพ์ 'เริ่มเกม' ก่อนนะครับ"
+            reply_text = "🤔 ยังไม่ได้เริ่มเกมเลยครับ พิมพ์ 'เริ่มเกม' ก่อนนะ"
         else:
             session = user_sessions[user_id]
-            if session['hint_given']:
-                reply_text = f"💡 ได้ให้คำใบ้ไปแล้ว: {session['meaning']}"
+            if session.get('hint_given'):
+                reply_text = f"💡 ให้คำใบ้ไปแล้วไงครับ: {session['meaning']}"
             else:
-                # ลดคะแนน
                 new_score = update_score(user_id, -2)
                 session['hint_given'] = True
                 user_sessions[user_id] = session
                 
                 reply_text = (f"💡 คำใบ้: {session['meaning']}\n"
-                              f"(-2 คะแนน, คะแนนตอนนี้: {new_score})\n\n"
-                              f"ลองตอบใหม่ดูสิ!")
+                              f"(-2 คะแนน | เหลือ: {new_score})\n\n"
+                              f"ถ้ารู้แล้วพิมพ์ตอบมาเลย!")
 
     # === MENU 5: คลังคำศัพท์ ===
     elif user_msg in ["คลังคำศัพท์", "คลัง", "vocab"]:
@@ -244,38 +235,42 @@ def handle_message(event):
             if not words:
                 reply_text = "📭 คลังว่างเปล่าครับ"
             else:
-                word_list = "\n".join([f"{i+1}. {item['word']}" for i, item in enumerate(words)])
-                reply_text = f"📚 ศัพท์ล่าสุด (20 คำ):\n\n{word_list}"
+                word_list = "\n".join([f"- {item['word']}" for item in words])
+                reply_text = f"📚 ศัพท์ 20 คำล่าสุด:\n\n{word_list}"
         except: 
-            reply_text = "⚠️ ดึงข้อมูลไม่ได้ครับ"
+            reply_text = "⚠️ ดึงข้อมูลไม่ได้ครับ เช็ค DB แป๊บ"
 
     # === MENU 6: ลบคำศัพท์ ===
-    elif user_msg.startswith("ลบคำศัพท์:") or user_msg.startswith("ลบ:"):
+    elif user_msg.startswith(("ลบคำศัพท์:", "ลบ:")):
         try:
             target = user_msg.split(":", 1)[1].strip()
             if target:
                 supabase.table("vocab").delete().ilike("word", target).execute()
-                reply_text = f"🗑️ ลบ '{target}' แล้วครับ"
+                reply_text = f"🗑️ ลบ '{target}' เรียบร้อยครับ"
             else: 
-                reply_text = "ระบุคำหลัง : ด้วยนะครับ"
+                reply_text = "อย่าลืมใส่คำที่ต้องการลบหลัง : ด้วยนะครับ"
         except: 
-            reply_text = "⚠️ ลบไม่ได้ครับ"
+            reply_text = "⚠️ ระบบลบมีปัญหา ลองใหม่ครับ"
 
-    # === MENU 7: เพิ่มคำศัพท์ ===
+    # === MENU 7: เพิ่มคำศัพท์ (ปรับปรุงใหม่ด้วย JSON) ===
     elif user_msg.lower().startswith(("เพิ่ม:", "add:")):
         try:
             word = user_msg.split(":", 1)[1].strip()
             if word:
-                prompt = (f"Word: '{word}'. Translate to Thai & English Example. "
-                          f"Format:\nMeaning: ...\nExample: ...")
+                # Prompt ขอ JSON เพื่อความแม่นยำ
+                prompt = (f"I want to learn the word '{word}'. "
+                          f"Provide the Thai meaning and 1 short English example sentence. "
+                          f"Response strictly in JSON format: "
+                          f'{{"meaning": "...", "example": "..."}}')
+                
                 res = model.generate_content(prompt)
                 
-                meaning, example = "-", "-"
-                for line in res.text.strip().split('\n'):
-                    if line.startswith("Meaning:"): 
-                        meaning = line.replace("Meaning:", "").strip()
-                    elif line.startswith("Example:"): 
-                        example = line.replace("Example:", "").strip()
+                # Cleaning JSON string
+                clean_text = res.text.strip().replace("```json", "").replace("```", "")
+                data = json.loads(clean_text)
+
+                meaning = data.get("meaning", "-")
+                example = data.get("example", "-")
 
                 supabase.table("vocab").insert({
                     "word": word, 
@@ -283,98 +278,73 @@ def handle_message(event):
                     "example_sentence": example
                 }).execute()
                 
-                reply_text = f"✅ จดแล้ว!\n🔤 {word}\n📖 {meaning}\n🗣️ {example}"
+                reply_text = f"✅ จดศัพท์ใหม่แล้ว!\n🔤 {word}\n📖 {meaning}\n🗣️ {example}"
             else: 
-                reply_text = "ใส่คำศัพท์หลัง : ด้วยนะครับ"
+                reply_text = "ใส่คำศัพท์หลัง : ด้วยนะครับ เช่น 'เพิ่ม: Resilience'"
         except Exception as e:
             print(f"Add vocab error: {e}")
-            reply_text = "⚠️ AI กำลังมึน ลองใหม่ครับ"
+            reply_text = "⚠️ AI งงเล็กน้อย ลองพิมพ์ใหม่อีกรอบครับ เช็คตัวสะกดนิดนึง"
 
-    # === MENU 8: ตอบคำถาม (ตรวจคำตอบ) ===
+    # === MENU 8: ตรวจคำตอบ (ปรับปรุงใหม่ ตอบทีเดียวจบ) ===
     else:
-        # เช็คว่ามี Session หรือไม่
         if user_id not in user_sessions:
-            reply_text = "🤔 พิมพ์ 'เริ่มเกม' เพื่อเริ่มทายคำศัพท์\nหรือพิมพ์ 'คำสั่ง' ดูเมนู"
+            reply_text = "🤔 อยากเล่นเกมพิมพ์ 'เริ่มเกม' ได้เลยครับ\nหรือพิมพ์ 'คำสั่ง' เพื่อดูเมนู"
         else:
             session = user_sessions[user_id]
-            correct_meaning = session['meaning']
             word = session['word']
-            current_attempt = session['attempts'] + 1
+            correct_meaning = session['meaning']
             
             try:
-                # ใช้ AI ตรวจคำตอบ (Flexible)
-                prompt = (f"Question: The word '{word}' means what in Thai?\n"
-                          f"Correct answer: {correct_meaning}\n"
-                          f"User answer: '{user_msg}'\n\n"
-                          f"Task: Check if user's answer is correct (accept synonyms/similar meanings).\n"
-                          f"Output ONLY:\n"
-                          f"Correct: [Yes or No]\n"
-                          f"Reason: [Thai explanation in 1 line]")
+                # Prompt ชุดเดียว ได้ครบทุกอย่าง (ตรวจ, เหตุผล, ตัวอย่าง)
+                prompt = (f"User is learning vocabulary. Word: '{word}' (Meaning: {correct_meaning}).\n"
+                          f"User answered: '{user_msg}'\n\n"
+                          f"1. Check if the answer is correct (accept synonyms).\n"
+                          f"2. Explain why in Thai (short and encouraging).\n"
+                          f"3. Create 3 distinct, simple English example sentences using '{word}'.\n\n"
+                          f"Response strictly in JSON format:\n"
+                          f'{{"is_correct": boolean, "reason_thai": "...", "examples": ["Ex1", "Ex2", "Ex3"]}}')
                 
                 res = model.generate_content(prompt)
-                ai_text = res.text.strip()
                 
-                # Parse
-                is_correct = False
-                reason = "ไม่ระบุ"
+                # Cleaning & Parsing
+                clean_text = res.text.strip().replace("```json", "").replace("```", "")
+                result = json.loads(clean_text)
                 
-                for line in ai_text.split('\n'):
-                    line = line.strip()
-                    if line.startswith("Correct:"): 
-                        is_correct = "yes" in line.lower()
-                    elif line.startswith("Reason:"): 
-                        reason = line.replace("Reason:", "").strip()
+                is_correct = result.get("is_correct", False)
+                reason = result.get("reason_thai", "ไม่มีคำอธิบาย")
+                examples = result.get("examples", [])
                 
-                # ตัดสินผล
+                # จัด Format ตัวอย่างประโยค
+                example_txt = "\n".join([f"• {ex}" for ex in examples])
+
+                # ล้าง Session ทันที (One-shot Logic)
+                del user_sessions[user_id]
+
                 if is_correct:
                     # ✅ ถูกต้อง
-                    points = 10 - (current_attempt * 2) - (5 if session['hint_given'] else 0)
-                    points = max(points, 1)  # ขั้นต่ำ 1 คะแนน
-                    
-                    new_score = update_score(user_id, points)
+                    new_score = update_score(user_id, 10)
                     mark_word_learned(user_id, word)
                     
-                    # ลบ session
-                    del user_sessions[user_id]
-                    
-                    # สร้างประโยคตัวอย่าง
-                    try:
-                        example_prompt = f"Create a simple English sentence using the word '{word}'. Just the sentence, no explanation."
-                        example_res = model.generate_content(example_prompt)
-                        example_sentence = example_res.text.strip()
-                    except:
-                        example_sentence = f"I need to {word} my notes."
-                    
-                    reply_text = (f"🎉 ถูกต้อง! +{points} คะแนน\n\n"
-                                  f"✅ {reason}\n"
+                    reply_text = (f"🎉 สุดยอด! ถูกต้องครับ (+10 คะแนน)\n\n"
+                                  f"💬 {reason}\n"
                                   f"📊 คะแนนรวม: {new_score}\n\n"
-                                  f"💬 ตัวอย่างประโยค:\n\"{example_sentence}\"\n\n"
-                                  f"พิมพ์ 'เริ่มเกม' เล่นต่อ!")
-                
+                                  f"🌟 ตัวอย่างการใช้:\n{example_txt}\n\n"
+                                  f"👉 พิมพ์ 'เริ่มเกม' เพื่อลุยข้อต่อไป!")
                 else:
-                    # ❌ ผิด
-                    if current_attempt < 3:
-                        session['attempts'] = current_attempt
-                        user_sessions[user_id] = session
-                        
-                        reply_text = (f"❌ ยังไม่ถูกนะครับ ({current_attempt}/3)\n\n"
-                                      f"💭 {reason}\n\n"
-                                      f"🔄 ลองใหม่อีกครั้ง หรือพิมพ์ 'คำใบ้'")
-                    else:
-                        # ครบ 3 ครั้ง
-                        del user_sessions[user_id]
-                        update_score(user_id, -3)
-                        
-                        reply_text = (f"❌ ครบ 3 ครั้งแล้ว (-3 คะแนน)\n\n"
-                                      f"📖 คำตอบที่ถูก: {correct_meaning}\n"
-                                      f"💡 {reason}\n\n"
-                                      f"จำไว้นะครับ! พิมพ์ 'เริ่มเกม' เล่นต่อ")
+                    # ❌ ผิด (เฉลยเลย)
+                    new_score = update_score(user_id, -2)
+                    
+                    reply_text = (f"❌ ยังไม่ใช่นะครับ (-2 คะแนน)\n\n"
+                                  f"📖 เฉลย: {word} แปลว่า \"{correct_meaning}\"\n"
+                                  f"💡 คำแนะนำ: {reason}\n\n"
+                                  f"🌟 ดูตัวอย่างประโยคช่วยจำ:\n{example_txt}\n\n"
+                                  f"ไม่ต้องซีเรียสครับ พิมพ์ 'เริ่มเกม' ลองคำใหม่เลย!")
             
             except Exception as e:
                 print(f"Check answer error: {e}")
-                reply_text = "😵‍💫 ระบบขัดข้อง ลองส่งใหม่อีกทีครับ"
+                reply_text = "😵‍💫 ระบบประมวลผลผิดพลาด ลองตอบใหม่อีกทีนะครับ"
 
-    # ส่งข้อความตอบกลับ
+    # ส่งข้อความกลับ Line
     if reply_text:
         try:
             line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
