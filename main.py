@@ -343,7 +343,7 @@ def handle_message(event):
             
             except Exception as e:
                 print(f"Check answer error: {e}")
-                reply_text = "😵‍💫 ระบบประมวลผลผิดพลาด ลองตอบใหม่อีกทีนะครับ"
+                reply_text = e 
 
     # ส่งข้อความกลับ Line
     if reply_text:
