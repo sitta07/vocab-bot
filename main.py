@@ -33,7 +33,7 @@ handler = WebhookHandler(LINE_SECRET)
 # 🔥 GEMINI CONFIG
 genai.configure(api_key=GEMINI_API_KEY)
 # ปรับ model เป็น flash เพื่อความไวและประหยัด
-model = genai.GenerativeModel('gemini-1.5-flash') 
+model = genai.GenerativeModel('gemini-flash-latest') 
 
 # Setup Supabase
 try:
