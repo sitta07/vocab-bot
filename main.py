@@ -41,56 +41,97 @@ user_flashcards = {}
 # 🔥 DEFAULT VOCABULARY LIST
 DEFAULT_WORDS = [
     {
-        "word": "learn",
-        "meaning": "เรียนรู้",
-        "example_sentence": "I want to learn English."
+        "word": "tedious",
+        "meaning": "น่าเบื่อ",
+        "example_sentence": "The task was so tedious that I almost gave up."
     },
     {
-        "word": "study", 
-        "meaning": "ศึกษา",
-        "example_sentence": "He studies at university."
+        "word": "Inconvenient",
+        "meaning": "ไม่สะดวก",
+        "example_sentence": "The meeting time was inconvenient for everyone."
     },
     {
-        "word": "practice",
-        "meaning": "ฝึกฝน", 
-        "example_sentence": "Practice makes perfect."
+        "word": "effort",
+        "meaning": "ความพยายาม",
+        "example_sentence": "She put a lot of effort into completing the project."
     },
     {
-        "word": "happy",
-        "meaning": "มีความสุข",
-        "example_sentence": "I am very happy today."
+        "word": "underneth",
+        "meaning": "ภายใต้",
+        "example_sentence": "The treasure was hidden underneath the old tree."
     },
     {
-        "word": "friend",
-        "meaning": "เพื่อน",
-        "example_sentence": "He is my best friend."
+        "word": "Crucial",
+        "meaning": "สำคัญ",
+        "example_sentence": "It is crucial to follow the safety guidelines."
     },
     {
-        "word": "book",
-        "meaning": "หนังสือ",
-        "example_sentence": "This is an interesting book."
+        "word": "Reside",
+        "meaning": "อยู่ข้างใน",
+        "example_sentence": "The answers to the questions reside within the book."
     },
     {
-        "word": "water",
-        "meaning": "น้ำ",
-        "example_sentence": "Drink more water."
+        "word": "Describe",
+        "meaning": "อธิบาย",
+        "example_sentence": "Can you describe the scene in detail?"
     },
     {
-        "word": "time",
-        "meaning": "เวลา",
-        "example_sentence": "Time is valuable."
+        "word": "Centralized",
+        "meaning": "ส่วนกลาง",
+        "example_sentence": "The company has a centralized management system."
     },
     {
-        "word": "home",
-        "meaning": "บ้าน",
-        "example_sentence": "I will go home soon."
+        "word": "Disrupted",
+        "meaning": "กระจัดกระจาย",
+        "example_sentence": "The event was disrupted by a sudden storm."
     },
     {
-        "word": "food",
-        "meaning": "อาหาร",
-        "example_sentence": "Thai food is delicious."
+        "word": "Restrict",
+        "meaning": "จำกัด",
+        "example_sentence": "The rules restrict the use of mobile phones in class."
+    },
+    {
+        "word": "Consider",
+        "meaning": "พิจารณา",
+        "example_sentence": "I will consider your suggestion carefully."
+    },
+    {
+        "word": "Violate",
+        "meaning": "ละเมิด",
+        "example_sentence": "You should not violate the privacy of others."
+    },
+    {
+        "word": "Opportunity",
+        "meaning": "โอกาส",
+        "example_sentence": "She got the opportunity to study abroad."
+    },
+    {
+        "word": "Conscious",
+        "meaning": "มีสติ",
+        "example_sentence": "He was conscious of the time and left the party early."
+    },
+    {
+        "word": "Stressed",
+        "meaning": "เครียด",
+        "example_sentence": "She felt stressed before the exam."
+    },
+    {
+        "word": "Convenience",
+        "meaning": "สะดวกสบาย",
+        "example_sentence": "Online shopping offers great convenience."
+    },
+    {
+        "word": "laundry detergent",
+        "meaning": "น้ำยาซักผ้า",
+        "example_sentence": "I need to buy laundry detergent for the washing machine."
+    },
+    {
+        "word": "Tasty",
+        "meaning": "น่ากิน",
+        "example_sentence": "The pizza was so tasty that I finished it in minutes."
     }
 ]
+
 
 # --- 2. HELPER FUNCTIONS ---
 def save_user(user_id):
