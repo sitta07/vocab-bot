@@ -37,7 +37,60 @@ except Exception as e:
 
 # 🔥 FLASHCARD STATE (RAM)
 user_flashcards = {}
-user_vocab_scores = {}  # Cache in memory
+
+# 🔥 DEFAULT VOCABULARY LIST
+DEFAULT_WORDS = [
+    {
+        "word": "learn",
+        "meaning": "เรียนรู้",
+        "example_sentence": "I want to learn English."
+    },
+    {
+        "word": "study", 
+        "meaning": "ศึกษา",
+        "example_sentence": "He studies at university."
+    },
+    {
+        "word": "practice",
+        "meaning": "ฝึกฝน", 
+        "example_sentence": "Practice makes perfect."
+    },
+    {
+        "word": "happy",
+        "meaning": "มีความสุข",
+        "example_sentence": "I am very happy today."
+    },
+    {
+        "word": "friend",
+        "meaning": "เพื่อน",
+        "example_sentence": "He is my best friend."
+    },
+    {
+        "word": "book",
+        "meaning": "หนังสือ",
+        "example_sentence": "This is an interesting book."
+    },
+    {
+        "word": "water",
+        "meaning": "น้ำ",
+        "example_sentence": "Drink more water."
+    },
+    {
+        "word": "time",
+        "meaning": "เวลา",
+        "example_sentence": "Time is valuable."
+    },
+    {
+        "word": "home",
+        "meaning": "บ้าน",
+        "example_sentence": "I will go home soon."
+    },
+    {
+        "word": "food",
+        "meaning": "อาหาร",
+        "example_sentence": "Thai food is delicious."
+    }
+]
 
 # --- 2. HELPER FUNCTIONS ---
 def save_user(user_id):
@@ -47,6 +100,32 @@ def save_user(user_id):
     except: 
         pass
 
+def init_vocab_database():
+    """ตรวจสอบและเพิ่มคำศัพท์พื้นฐานลงในฐานข้อมูล"""
+    try:
+        # ตรวจสอบว่ามีข้อมูลในตาราง vocab หรือไม่
+        result = supabase.table("vocab").select("count", count="exact").execute()
+        
+        if result.count == 0:
+            print("⚠️ ตาราง vocab ว่างเปล่า กำลังเพิ่มคำศัพท์พื้นฐาน...")
+            
+            # เพิ่มข้อมูลคำศัพท์พื้นฐาน
+            for word_data in DEFAULT_WORDS:
+                try:
+                    supabase.table("vocab").upsert({
+                        "word": word_data["word"],
+                        "meaning": word_data["meaning"],
+                        "example_sentence": word_data["example_sentence"]
+                    }, on_conflict="word").execute()
+                except Exception as e:
+                    print(f"Error adding word {word_data['word']}: {e}")
+            
+            print(f"✅ เพิ่มคำศัพท์พื้นฐาน {len(DEFAULT_WORDS)} คำเรียบร้อยแล้ว")
+        else:
+            print(f"✅ ตาราง vocab มีคำศัพท์อยู่แล้ว: {result.count} คำ")
+    except Exception as e:
+        print(f"Init vocab database error: {e}")
+
 def get_user_vocab_scores(user_id):
     """ดึงคะแนนคำศัพท์ของผู้ใช้จากตาราง user_scores"""
     try:
@@ -55,8 +134,6 @@ def get_user_vocab_scores(user_id):
         if not result.data:
             return {}
         
-        # user_scores มีโครงสร้าง: user_id, score, learned_words, vocab_stats
-        # เราจะใช้ field 'vocab_stats' เก็บข้อมูลเป็น JSON
         user_data = result.data[0]
         
         if 'vocab_stats' in user_data and user_data['vocab_stats']:
@@ -131,43 +208,32 @@ def update_vocab_score(user_id, word, answer_is_yes):
         
     except Exception as e:
         print(f"Update vocab score error: {e}")
-        # ใช้ cache ใน memory เป็น fallback
-        if user_id not in user_vocab_scores:
-            user_vocab_scores[user_id] = {}
-        
-        if word not in user_vocab_scores[user_id]:
-            user_vocab_scores[user_id][word] = {
-                'yes': 0,
-                'no': 0,
-                'difficulty': 0,
-                'last_reviewed': datetime.now().isoformat()
-            }
-        
-        current = user_vocab_scores[user_id][word]
-        
-        if answer_is_yes:
-            current['yes'] += 1
-            if current['yes'] >= 3 and current['difficulty'] > 0:
-                current['difficulty'] -= 1
-        else:
-            current['no'] += 1
-            if current['no'] >= 2:
-                current['difficulty'] = min(current['difficulty'] + 1, 2)
-        
-        current['last_reviewed'] = datetime.now().isoformat()
-        current['priority_score'] = current['no'] * 2 - current['yes']
-        
-        return current
+        # สร้าง cache ใน memory ชั่วคราว
+        return {
+            'yes': 1 if answer_is_yes else 0,
+            'no': 0 if answer_is_yes else 1,
+            'difficulty': 0,
+            'last_reviewed': datetime.now().isoformat(),
+            'priority_score': (0 if answer_is_yes else 1) * 2 - (1 if answer_is_yes else 0)
+        }
 
 def get_random_flashcard(user_id):
     """สุ่ม flashcard โดยพิจารณาจากคะแนน"""
     try:
-        # ดึงคำศัพท์ทั้งหมด
+        # ดึงคำศัพท์ทั้งหมดจากฐานข้อมูล
         vocab_result = supabase.table("vocab").select("*").execute()
-        if not vocab_result.data:
-            return get_default_flashcard()
         
-        vocab_list = vocab_result.data
+        # ถ้าฐานข้อมูลไม่มีข้อมูล ให้ใช้ DEFAULT_WORDS
+        if not vocab_result.data or len(vocab_result.data) == 0:
+            init_vocab_database()
+            vocab_result = supabase.table("vocab").select("*").execute()
+            if not vocab_result.data:
+                # ถ้ายังไม่มี ให้ใช้ DEFAULT_WORDS โดยตรง
+                vocab_list = DEFAULT_WORDS
+            else:
+                vocab_list = vocab_result.data
+        else:
+            vocab_list = vocab_result.data
         
         # ดึงคะแนนของผู้ใช้
         user_scores = get_user_vocab_scores(user_id)
@@ -229,57 +295,26 @@ def get_random_flashcard(user_id):
         
     except Exception as e:
         print(f"Get flashcard error: {e}")
-        return get_default_flashcard()
-
-def get_default_flashcard():
-    """Default flashcard list"""
-    default_words = [
-        {
-            "word": "learn",
-            "meaning": "เรียนรู้",
-            "example_sentence": "I want to learn English."
-        },
-        {
-            "word": "study", 
-            "meaning": "ศึกษา",
-            "example_sentence": "He studies at university."
-        },
-        {
-            "word": "practice",
-            "meaning": "ฝึกฝน", 
-            "example_sentence": "Practice makes perfect."
-        },
-        {
-            "word": "happy",
-            "meaning": "มีความสุข",
-            "example_sentence": "I am very happy today."
-        },
-        {
-            "word": "friend",
-            "meaning": "เพื่อน",
-            "example_sentence": "He is my best friend."
+        # ใช้ default word ถ้ามีปัญหา
+        selected = random.choice(DEFAULT_WORDS)
+        
+        if random.choice([True, False]):
+            question = f"คำว่า '{selected['meaning']}' ภาษาอังกฤษ คืออะไร?"
+            correct_answer = selected['word']
+            question_type = "th_to_en"
+        else:
+            question = f"ภาษาอังกฤษ '{selected['word']}' ภาษาไทยคืออะไร?"
+            correct_answer = selected['meaning']
+            question_type = "en_to_th"
+        
+        return {
+            'word': selected['word'],
+            'meaning': selected['meaning'],
+            'question': question,
+            'correct_answer': correct_answer,
+            'question_type': question_type,
+            'example': selected['example_sentence']
         }
-    ]
-    
-    selected = random.choice(default_words)
-    
-    if random.choice([True, False]):
-        question = f"คำว่า '{selected['meaning']}' ภาษาอังกฤษ คืออะไร?"
-        correct_answer = selected['word']
-        question_type = "th_to_en"
-    else:
-        question = f"ภาษาอังกฤษ '{selected['word']}' ภาษาไทยคืออะไร?"
-        correct_answer = selected['meaning']
-        question_type = "en_to_th"
-    
-    return {
-        'word': selected['word'],
-        'meaning': selected['meaning'],
-        'question': question,
-        'correct_answer': correct_answer,
-        'question_type': question_type,
-        'example': selected['example_sentence']
-    }
 
 def get_review_words(user_id, count=3):
     """ดึงคำศัพท์ที่ยังไม่แม่นมาทบทวน"""
@@ -324,7 +359,15 @@ def get_review_words(user_id, count=3):
                         'example': vocab_info.get('example_sentence', 'ไม่มีตัวอย่าง')
                     })
             except:
-                pass
+                # ถ้าไม่เจอในฐานข้อมูล ให้ใช้ข้อมูลจาก DEFAULT_WORDS
+                for default_word in DEFAULT_WORDS:
+                    if default_word['word'].lower() == word.lower():
+                        review_words.append({
+                            'word': word,
+                            'meaning': default_word['meaning'],
+                            'example': default_word['example_sentence']
+                        })
+                        break
         
         return review_words
         
@@ -476,6 +519,19 @@ def handle_message(event):
         except Exception as e:
             print(f"LINE Reply Error: {e}")
 
+# --- 5. INITIALIZATION ---
+def init_app():
+    """เตรียมข้อมูลเริ่มต้นเมื่อเริ่มแอป"""
+    print("🚀 กำลังเตรียมข้อมูล Flashcard Bot...")
+    
+    # ตรวจสอบและเพิ่มคำศัพท์พื้นฐาน
+    init_vocab_database()
+    
+    print("✅ Flashcard Bot พร้อมใช้งานแล้ว!")
+
 if __name__ == "__main__":
+    # เตรียมข้อมูลเริ่มต้น
+    init_app()
+    
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
