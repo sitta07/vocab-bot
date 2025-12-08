@@ -1,14 +1,14 @@
-# vocab-bot-offline.py
+# vocab-flashcard-bot.py
 import os
 import random
 import json
+from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage, TextSendMessage
 from supabase import create_client, Client
 from dotenv import load_dotenv
-import difflib  # สำหรับตรวจสอบความใกล้เคียงของคำ
 
 # --- 1. CONFIGURATION ---
 load_dotenv()
@@ -35,91 +35,9 @@ try:
 except Exception as e:
     print(f"Supabase Connection Error: {e}")
 
-# 🔥 GLOBAL STATE (RAM)
-user_sessions = {}
-
-# 🔥 LOCAL SYNONYMS DATABASE
-SYNONYMS_DB = {
-    # คำกริยา
-    "learn": ["เรียนรู้", "เรียน", "ศึกษา", "หาความรู้", "ฝึกฝน"],
-    "study": ["เรียน", "ศึกษา", "ค้นคว้า", "ทบทวน"],
-    "practice": ["ฝึกฝน", "ฝึก", "ปฏิบัติ", "ทำซ้ำ"],
-    "improve": ["ปรับปรุง", "พัฒนา", "ทำให้ดีขึ้น"],
-    "remember": ["จำ", "จำได้", "ระลึกได้"],
-    "forget": ["ลืม", "จำไม่ได้"],
-    "understand": ["เข้าใจ", "รู้เรื่อง", "ตระหนัก"],
-    
-    # คำคุณศัพท์
-    "happy": ["มีความสุข", "สุขใจ", "ปลาบปลื้ม", "ยินดี"],
-    "sad": ["เศร้า", "เสียใจ", "เศร้าสร้อย"],
-    "big": ["ใหญ่", "กว้างขวาง", "มโหฬาร"],
-    "small": ["เล็ก", "จ้อย", "น้อย"],
-    "beautiful": ["สวย", "งาม", "งดงาม"],
-    "difficult": ["ยาก", "ลำบาก", "ยุ่งยาก"],
-    "easy": ["ง่าย", "สะดวก", "ราบรื่น"],
-    
-    # คำนาม
-    "knowledge": ["ความรู้", "ภูมิรู้", "วิชาการ"],
-    "friend": ["เพื่อน", "สหาย", "มิตร"],
-    "home": ["บ้าน", "ที่อยู่อาศัย", "เรือน"],
-    "food": ["อาหาร", "ของกิน", "โภชนาการ"],
-    "water": ["น้ำ", "แหล่งน้ำ"],
-    "money": ["เงิน", "ทุน", "ทรัพย์"],
-    "time": ["เวลา", "วาระ", "คราว"],
-    
-    # คำพื้นฐานเพิ่มเติม
-    "good": ["ดี", "ดีเยี่ยม", "ยอดเยี่ยม", "เลิศ"],
-    "bad": ["แย่", "ไม่ดี", "เลว"],
-    "new": ["ใหม่", "ใหม่เอี่ยม"],
-    "old": ["เก่า", "แก่", "โบราณ"],
-    "fast": ["เร็ว", "ว่องไว", "รวดเร็ว"],
-    "slow": ["ช้า", "เนิบ", "เชื่องช้า"],
-    "hot": ["ร้อน", "อุ่น"],
-    "cold": ["เย็น", "หนาว", "เย็นยะเยือก"],
-    "high": ["สูง", "ชั้นสูง"],
-    "low": ["ต่ำ", "ชั้นต่ำ"],
-    "right": ["ถูกต้อง", "ใช่", "เหมาะสม"],
-    "wrong": ["ผิด", "ไม่ถูกต้อง", "คลาดเคลื่อน"],
-}
-
-# 🔥 EXAMPLE SENTENCES DATABASE
-EXAMPLES_DB = {
-    "learn": [
-        "I want to learn English.",
-        "She learns quickly.",
-        "We learn from our mistakes."
-    ],
-    "study": [
-        "He studies at university.",
-        "I need to study for the exam.",
-        "She is studying medicine."
-    ],
-    "practice": [
-        "Practice makes perfect.",
-        "I practice piano every day.",
-        "They practice speaking English."
-    ],
-    "happy": [
-        "I am very happy today.",
-        "Happy birthday to you!",
-        "They look so happy together."
-    ],
-    "sad": [
-        "She felt sad after the movie.",
-        "It's sad to see them go.",
-        "Why are you so sad?"
-    ],
-    "friend": [
-        "He is my best friend.",
-        "We met a new friend yesterday.",
-        "A good friend is hard to find."
-    ],
-    "home": [
-        "I will go home soon.",
-        "Home is where the heart is.",
-        "She works from home."
-    ],
-}
+# 🔥 FLASHCARD STATE (RAM)
+user_flashcards = {}
+user_vocab_scores = {}
 
 # --- 2. HELPER FUNCTIONS ---
 def save_user(user_id):
@@ -129,234 +47,266 @@ def save_user(user_id):
     except: 
         pass
 
-def get_user_score(user_id):
-    """ดึงคะแนนปัจจุบัน"""
+def get_user_vocab_scores(user_id):
+    """ดึงคะแนนคำศัพท์ของผู้ใช้"""
     try:
-        result = supabase.table("user_scores").select("score, learned_words").eq("user_id", user_id).execute()
+        result = supabase.table("vocab_scores").select("*").eq("user_id", user_id).execute()
+        scores = {}
         if result.data:
-            return result.data[0]['score'], result.data[0].get('learned_words', [])
-        return 0, []
+            for item in result.data:
+                scores[item['word']] = {
+                    'yes': item.get('yes_count', 0),
+                    'no': item.get('no_count', 0),
+                    'last_reviewed': item.get('last_reviewed'),
+                    'difficulty': item.get('difficulty', 0)  # 0 = ง่าย, 1 = ปานกลาง, 2 = ยาก
+                }
+        return scores
     except:
-        return 0, []
+        return {}
 
-def update_score(user_id, points):
-    """เพิ่ม/ลดคะแนน"""
+def update_vocab_score(user_id, word, answer_is_yes):
+    """อัพเดทคะแนนคำศัพท์เมื่อผู้ใช้ตอบ Yes/No"""
     try:
-        score, learned = get_user_score(user_id)
-        new_score = score + points
-        supabase.table("user_scores").upsert({
+        scores = get_user_vocab_scores(user_id)
+        current = scores.get(word, {'yes': 0, 'no': 0, 'difficulty': 0})
+        
+        if answer_is_yes:
+            current['yes'] = current.get('yes', 0) + 1
+            # ลดความยากเมื่อตอบถูกบ่อย
+            if current['yes'] >= 3 and current['difficulty'] > 0:
+                current['difficulty'] -= 1
+        else:
+            current['no'] = current.get('no', 0) + 1
+            # เพิ่มความยากเมื่อตอบผิดบ่อย
+            if current['no'] >= 2:
+                current['difficulty'] = min(current.get('difficulty', 0) + 1, 2)
+        
+        # คำนวณคะแนนรวมสำหรับเรียงลำดับ (ยิ่งตอบผิดมาก ยิ่งควรทบทวนบ่อย)
+        priority_score = current['no'] * 2 - current['yes']
+        
+        # บันทึกลงฐานข้อมูล
+        supabase.table("vocab_scores").upsert({
             "user_id": user_id,
-            "score": new_score,
-            "learned_words": learned
-        }, on_conflict="user_id").execute()
-        return new_score
-    except:
-        return 0
+            "word": word,
+            "yes_count": current['yes'],
+            "no_count": current['no'],
+            "difficulty": current['difficulty'],
+            "priority_score": priority_score,
+            "last_reviewed": datetime.now().isoformat()
+        }, on_conflict=["user_id", "word"]).execute()
+        
+        return current
+    except Exception as e:
+        print(f"Update score error: {e}")
+        return None
 
-def mark_word_learned(user_id, word):
-    """บันทึกว่าเรียนคำนี้แล้ว"""
+def get_random_flashcard(user_id):
+    """สุ่ม flashcard โดยพิจารณาจากคะแนน (คำที่ตอบผิดบ่อยจะได้โอกาสมากกว่า)"""
     try:
-        score, learned = get_user_score(user_id)
-        if word.lower() not in [w.lower() for w in learned]:
-            learned.append(word.lower())
-            supabase.table("user_scores").upsert({
-                "user_id": user_id,
-                "score": score,
-                "learned_words": learned
-            }, on_conflict="user_id").execute()
-    except:
-        pass
+        # ดึงคำศัพท์ทั้งหมด
+        vocab_result = supabase.table("vocab").select("*").execute()
+        if not vocab_result.data:
+            return get_default_flashcard()
+        
+        vocab_list = vocab_result.data
+        
+        # ดึงคะแนนของผู้ใช้
+        user_scores = get_user_vocab_scores(user_id)
+        
+        # คำนวณน้ำหนักสำหรับการสุ่ม
+        weighted_vocab = []
+        for item in vocab_list:
+            word = item['word']
+            score_data = user_scores.get(word, {'yes': 0, 'no': 0, 'difficulty': 0})
+            
+            # คำนวณน้ำหนัก: ยิ่งตอบผิดมาก ยิ่งได้น้ำหนักมาก
+            weight = 1 + (score_data['no'] * 2) - (score_data['yes'] * 0.5)
+            weight = max(1, min(weight, 10))  # จำกัดน้ำหนักระหว่าง 1-10
+            
+            # เพิ่มน้ำหนักสำหรับคำที่ไม่ได้ทบทวนนาน
+            last_reviewed = score_data.get('last_reviewed')
+            if last_reviewed:
+                last_date = datetime.fromisoformat(last_reviewed.replace('Z', '+00:00'))
+                days_since = (datetime.now() - last_date).days
+                if days_since > 7:
+                    weight *= 2
+            
+            weighted_vocab.extend([item] * int(weight))
+        
+        # ถ้ายังไม่มีคำศัพท์ใดๆ หรือ weight calculation ไม่ได้ผล
+        if not weighted_vocab:
+            weighted_vocab = vocab_list
+        
+        # สุ่มเลือกคำศัพท์
+        selected = random.choice(weighted_vocab)
+        
+        # สุ่มรูปแบบคำถาม (ไทย->อังกฤษ หรือ อังกฤษ->ไทย)
+        if random.choice([True, False]):
+            # รูปแบบ: คำไทย -> อังกฤษ
+            question = f"คำว่า '{selected.get('meaning', 'ไม่ระบุ')}' ภาษาอังกฤษ คืออะไร?"
+            correct_answer = selected['word']
+            question_type = "th_to_en"
+        else:
+            # รูปแบบ: อังกฤษ -> ไทย
+            question = f"ภาษาอังกฤษ '{selected['word']}' ภาษาไทยคืออะไร?"
+            correct_answer = selected.get('meaning', 'ไม่ระบุ')
+            question_type = "en_to_th"
+        
+        return {
+            'word': selected['word'],
+            'meaning': selected.get('meaning', 'ไม่ระบุ'),
+            'question': question,
+            'correct_answer': correct_answer,
+            'question_type': question_type,
+            'example': selected.get('example_sentence', 'ไม่มีตัวอย่าง')
+        }
+        
+    except Exception as e:
+        print(f"Get flashcard error: {e}")
+        return get_default_flashcard()
 
-def get_random_vocab(exclude_words=[]):
-    """สุ่มศัพท์ที่ยังไม่เคยเรียน"""
-    try:
-        vocab_list = supabase.table("vocab").select("*").execute().data
-        if not vocab_list:
-            # ถ้าไม่มีใน DB ให้ใช้ default words
-            return get_default_vocab(exclude_words)
-        
-        # กรองคำที่เรียนแล้ว
-        available = [v for v in vocab_list if v['word'].lower() not in [w.lower() for w in exclude_words]]
-        
-        if not available:
-            # ถ้าเรียนหมดแล้ว ให้สุ่มจากทั้งหมด
-            available = vocab_list
-        
-        return random.choice(available)
-    except:
-        return get_default_vocab(exclude_words)
-
-def get_default_vocab(exclude_words=[]):
-    """Default vocabulary list"""
+def get_default_flashcard():
+    """Default flashcard list"""
     default_words = [
-        {"word": "learn", "meaning": "เรียนรู้", "example": "I want to learn English."},
-        {"word": "study", "meaning": "ศึกษา", "example": "He studies at university."},
-        {"word": "practice", "meaning": "ฝึกฝน", "example": "Practice makes perfect."},
-        {"word": "happy", "meaning": "มีความสุข", "example": "I am very happy today."},
-        {"word": "friend", "meaning": "เพื่อน", "example": "He is my best friend."},
-        {"word": "home", "meaning": "บ้าน", "example": "I will go home soon."},
-        {"word": "book", "meaning": "หนังสือ", "example": "This is an interesting book."},
-        {"word": "water", "meaning": "น้ำ", "example": "Drink more water."},
-        {"word": "food", "meaning": "อาหาร", "example": "Thai food is delicious."},
-        {"word": "time", "meaning": "เวลา", "example": "Time is valuable."},
+        {
+            "word": "learn",
+            "meaning": "เรียนรู้",
+            "example": "I want to learn English."
+        },
+        {
+            "word": "study", 
+            "meaning": "ศึกษา",
+            "example": "He studies at university."
+        },
+        {
+            "word": "practice",
+            "meaning": "ฝึกฝน", 
+            "example": "Practice makes perfect."
+        },
+        {
+            "word": "happy",
+            "meaning": "มีความสุข",
+            "example": "I am very happy today."
+        },
+        {
+            "word": "friend",
+            "meaning": "เพื่อน",
+            "example": "He is my best friend."
+        }
     ]
     
-    available = [w for w in default_words if w['word'].lower() not in exclude_words]
-    if not available:
-        available = default_words
+    selected = random.choice(default_words)
+    if random.choice([True, False]):
+        question = f"คำว่า '{selected['meaning']}' ภาษาอังกฤษ คืออะไร?"
+        correct_answer = selected['word']
+        question_type = "th_to_en"
+    else:
+        question = f"ภาษาอังกฤษ '{selected['word']}' ภาษาไทยคืออะไร?"
+        correct_answer = selected['meaning']
+        question_type = "en_to_th"
     
-    return random.choice(available)
-
-def check_answer_offline(word, correct_meaning, user_answer):
-    """ตรวจคำตอบแบบ offline"""
-    user_answer = user_answer.strip().lower()
-    correct_meaning_lower = correct_meaning.lower()
-    
-    # 1. ตรวจสอบตรงกันเป๊ะ
-    if user_answer == correct_meaning_lower:
-        return {
-            "is_correct": True,
-            "feedback": "ถูกต้องเป๊ะ! 🎯",
-            "confidence": 1.0
-        }
-    
-    # 2. ตรวจสอบคำพ้องความหมาย
-    synonyms = SYNONYMS_DB.get(word.lower(), [])
-    for synonym in synonyms:
-        if synonym in user_answer or user_answer in synonym:
-            return {
-                "is_correct": True,
-                "feedback": f"ใช้คำพ้องความหมาย '{synonym}' ก็ได้ครับ! ✅",
-                "confidence": 0.9
-            }
-    
-    # 3. ตรวจสอบความใกล้เคียง (string similarity)
-    similarity = difflib.SequenceMatcher(None, user_answer, correct_meaning_lower).ratio()
-    if similarity > 0.7:
-        return {
-            "is_correct": True,
-            "feedback": f"ใกล้เคียงมาก! ({similarity*100:.0f}%) 👍",
-            "confidence": similarity
-        }
-    
-    # 4. ตรวจสอบคำที่อยู่ในความหมายเดียวกัน
-    correct_words = correct_meaning_lower.split()
-    user_words = user_answer.split()
-    
-    matching_words = sum(1 for uw in user_words if any(cw in uw or uw in cw for cw in correct_words))
-    if matching_words >= len(correct_words) * 0.5:  # ครึ่งหนึ่งของคำที่ต้องใช้
-        return {
-            "is_correct": True,
-            "feedback": "ใช้คำบางส่วนถูกต้องแล้ว! 😊",
-            "confidence": 0.6
-        }
-    
-    # 5. ถ้าผิดทั้งหมด
     return {
-        "is_correct": False,
-        "feedback": f"ลองใหม่อีกครั้งนะครับ",
-        "confidence": 0.0
+        'word': selected['word'],
+        'meaning': selected['meaning'],
+        'question': question,
+        'correct_answer': correct_answer,
+        'question_type': question_type,
+        'example': selected['example']
     }
 
-def get_examples(word, count=2):
-    """ดึงตัวอย่างประโยค"""
-    word_lower = word.lower()
-    
-    # 1. ดูจาก examples database
-    if word_lower in EXAMPLES_DB:
-        examples = EXAMPLES_DB[word_lower]
-        if len(examples) >= count:
-            return random.sample(examples, count)
-    
-    # 2. ดูจาก DB
+def get_review_words(user_id, count=3):
+    """ดึงคำศัพท์ที่ยังไม่แม่น (ตอบ No บ่อย) มาทบทวน"""
     try:
-        result = supabase.table("vocab").select("example_sentence").eq("word", word).execute()
-        if result.data and result.data[0].get('example_sentence'):
-            return [result.data[0]['example_sentence']] + ["Try to use this word in conversation."]
+        scores = get_user_vocab_scores(user_id)
+        
+        # กรองคำที่ตอบผิดบ่อย (no_count > yes_count)
+        weak_words = []
+        for word, data in scores.items():
+            if data.get('no', 0) > data.get('yes', 0):
+                weak_words.append({
+                    'word': word,
+                    'no_count': data.get('no', 0),
+                    'yes_count': data.get('yes', 0)
+                })
+        
+        # เรียงลำดับตามจำนวนครั้งที่ตอบผิด
+        weak_words.sort(key=lambda x: x['no_count'], reverse=True)
+        
+        # จำกัดจำนวนคำ
+        review_words = weak_words[:count]
+        
+        # ถ้าไม่มีคำที่ตอบผิดบ่อย ให้เลือกคำที่ยังไม่ได้เรียนหรือเรียนน้อยครั้ง
+        if not review_words:
+            # ดึงคำศัพท์ทั้งหมด
+            vocab_result = supabase.table("vocab").select("word, meaning").execute()
+            all_words = vocab_result.data if vocab_result.data else []
+            
+            # กรองคำที่ยังไม่มีคะแนนหรือมีคะแนนน้อย
+            for word_data in all_words:
+                word = word_data['word']
+                if word not in scores or scores[word].get('yes', 0) + scores[word].get('no', 0) < 2:
+                    review_words.append({
+                        'word': word,
+                        'meaning': word_data.get('meaning', 'ไม่ระบุ')
+                    })
+                    if len(review_words) >= count:
+                        break
+        
+        return review_words
     except:
-        pass
-    
-    # 3. Default examples
-    return [
-        f"Can you use '{word}' in a sentence?",
-        f"Practice using the word '{word}' daily."
-    ]
-
-def add_vocab_offline(word):
-    """เพิ่มคำศัพท์แบบ offline"""
-    # ตัวอย่างความหมายพื้นฐาน
-    basic_meanings = {
-        "learn": "เรียนรู้",
-        "study": "ศึกษา", 
-        "practice": "ฝึกฝน",
-        "happy": "มีความสุข",
-        "sad": "เศร้า",
-        "friend": "เพื่อน",
-        "home": "บ้าน",
-        "book": "หนังสือ",
-        "water": "น้ำ",
-        "food": "อาหาร",
-        "time": "เวลา",
-        "good": "ดี",
-        "bad": "แย่",
-        "new": "ใหม่",
-        "old": "เก่า",
-        "big": "ใหญ่",
-        "small": "เล็ก"
-    }
-    
-    word_lower = word.lower()
-    meaning = basic_meanings.get(word_lower, "โปรดระบุความหมายเพิ่มเติม")
-    
-    # สร้างตัวอย่างประโยคง่ายๆ
-    examples = [
-        f"I want to {word} more vocabulary.",
-        f"She can {word} very well.",
-        f"Let's {word} together."
-    ]
-    
-    return {
-        "meaning": meaning,
-        "example": random.choice(examples)
-    }
+        return []
 
 # --- 3. API ENDPOINTS ---
 @app.get("/")
 def health_check():
-    return {"status": "ok", "msg": "Teacher Bot V3 (Offline Mode) is ready!"}
+    return {"status": "ok", "msg": "Flashcard Bot is ready!"}
 
-@app.get("/broadcast-quiz")
-def broadcast_quiz():
-    """ยิงโจทย์หาทุกคน (Cron Job)"""
+@app.get("/daily-review")
+def daily_review():
+    """ส่งคำศัพท์ให้ทบทวนตามเวลา (Cron Job)"""
     try:
         users = supabase.table("users").select("user_id").execute().data
         if not users: 
             return {"msg": "No users found"}
-
+        
+        current_hour = datetime.now().hour
+        
+        # กำหนดข้อความตามเวลา
+        if 5 <= current_hour < 12:
+            time_greeting = "สวัสดีตอนเช้า"
+        elif 12 <= current_hour < 17:
+            time_greeting = "สวัสดีตอนกลางวัน"
+        elif 17 <= current_hour < 21:
+            time_greeting = "สวัสดีตอนเย็น"
+        else:
+            time_greeting = "สวัสดีตอนค่ำ"
+        
         for user in users:
             user_id = user['user_id']
-            _, learned = get_user_score(user_id)
-            selected = get_random_vocab(learned)
             
-            if not selected:
-                continue
+            # ดึงคำศัพท์ที่ควรทบทวน
+            review_words = get_review_words(user_id, 3)
+            
+            if review_words:
+                # สร้างข้อความทบทวน
+                review_text = f"{time_greeting} : ทบทวนคำศัพท์กันหน่อย {len(review_words)} คำที่คุณยังไม่แม่น\n\n"
                 
-            word = selected['word']
-            meaning = selected.get('meaning', '-')
-
-            msg = (f"🔥 ภารกิจมาแล้ว!\n\n"
-                   f"❓ คำว่า '{word}' แปลว่าอะไร?\n\n"
-                   f"💡 ตอบผิดไม่เป็นไร เดี๋ยวมีเฉลยพร้อมตัวอย่างให้ครับ")
-
-            try:
-                line_bot_api.push_message(user_id, TextSendMessage(text=msg))
-                # เก็บ session
-                user_sessions[user_id] = {
-                    'word': word,
-                    'meaning': meaning
-                }
-            except: 
-                continue 
+                for i, word_data in enumerate(review_words, 1):
+                    # ดึงตัวอย่างประโยค
+                    try:
+                        vocab_result = supabase.table("vocab").select("example_sentence").eq("word", word_data['word']).execute()
+                        example = vocab_result.data[0]['example_sentence'] if vocab_result.data else "ไม่มีตัวอย่าง"
+                    except:
+                        example = "ไม่มีตัวอย่าง"
+                    
+                    review_text += f"{i}. {word_data['word']} = {word_data.get('meaning', 'ไม่ระบุ')}\n"
+                    review_text += f"   📝 ตัวอย่าง: {example}\n\n"
+                
+                try:
+                    line_bot_api.push_message(user_id, TextSendMessage(text=review_text))
+                except Exception as e:
+                    print(f"Push message error for {user_id}: {e}")
+                    continue
             
         return {"status": "success", "sent_to": len(users)}
     except Exception as e:
@@ -380,192 +330,190 @@ def handle_message(event):
     
     save_user(user_id)
     reply_text = ""
-
-    # === MENU 1: คำสั่ง ===
+    
+    # === MENU: คำสั่ง ===
     if user_msg in ["คำสั่ง", "เมนู", "menu", "help"]:
-        score, learned = get_user_score(user_id)
-        reply_text = (f"🤖 คู่มือครูพี่ Bot V3 (Offline Mode):\n\n"
-                      f"1. เริ่มเกม -> เริ่มทายคำศัพท์\n"
-                      f"2. คะแนน -> ดูคะแนน\n"
-                      f"3. คำใบ้ -> ขอคำใบ้ (ลด -2 คะแนน)\n"
-                      f"4. เพิ่ม:[ศัพท์] -> เพิ่มคำใหม่\n"
-                      f"5. ลบ:[ศัพท์] -> ลบคำ\n"
-                      f"6. คลัง -> ดูศัพท์ทั้งหมด\n"
-                      f"7. คลัง2 -> ดูศัพท์ที่เรียนแล้ว\n\n"
-                      f"📊 คะแนน: {score} | 📚 จำได้: {len(learned)} คำ")
-
-    # === MENU 2: คะแนน ===
-    elif user_msg in ["คะแนน", "score", "สถิติ", "stats"]:
-        score, learned = get_user_score(user_id)
-        reply_text = (f"📊 สถิติความเทพ:\n\n"
-                      f"⭐ คะแนนรวม: {score} XP\n"
-                      f"📚 คำศัพท์ที่แม่นแล้ว: {len(learned)} คำ")
+        scores = get_user_vocab_scores(user_id)
+        total_words = len(scores)
+        known_words = sum(1 for data in scores.values() if data.get('yes', 0) > data.get('no', 0))
         
-        if learned:
-            learned_list = ", ".join(learned[:10])
-            if len(learned) > 10:
-                learned_list += f" และอีก {len(learned)-10} คำ"
-            reply_text += f"\n\nคำที่เรียนแล้ว:\n{learned_list}"
-
-    # === MENU 3: เริ่มเกม ===
-    elif user_msg in ["เริ่มเกม", "เริ่ม", "start", "play", "game"]:
-        _, learned = get_user_score(user_id)
-        selected = get_random_vocab(learned)
+        reply_text = (f"📚 Flashcard Bot - คำสั่ง\n\n"
+                      f"1. เริ่มเกม : เริ่มเล่นทายคำศัพท์\n"
+                      f"2. สถิติ : ดูสถิติการเรียน\n"
+                      f"3. ทบทวน : แสดงคำศัพท์ที่ควรทบทวน\n"
+                      f"4. เพิ่มคำศัพท์:[คำอังกฤษ]:[คำไทย] : เพิ่มคำศัพท์ใหม่\n"
+                      f"5. ตัวอย่าง : ขอดูตัวอย่างการใช้\n\n"
+                      f"📊 สถิติ: รู้แล้ว {known_words}/{total_words} คำ")
+    
+    # === MENU: สถิติ ===
+    elif user_msg in ["สถิติ", "stat", "stats", "score"]:
+        scores = get_user_vocab_scores(user_id)
+        total_words = len(scores)
         
-        if not selected:
-            reply_text = "📭 คลังศัพท์ว่างเปล่า! พิมพ์ 'เพิ่ม:[คำศัพท์]' เพื่อใส่คำใหม่ก่อนครับ"
+        if total_words == 0:
+            reply_text = "📊 คุณยังไม่ได้เริ่มเรียนคำศัพท์เลย พิมพ์ 'เริ่มเกม :' เพื่อเริ่มต้น吧!"
         else:
-            word = selected['word']
-            meaning = selected.get('meaning', '-')
+            # คำนวณสถิติ
+            known_words = sum(1 for data in scores.values() if data.get('yes', 0) > data.get('no', 0))
+            difficult_words = sum(1 for data in scores.values() if data.get('no', 0) >= 3)
+            total_yes = sum(data.get('yes', 0) for data in scores.values())
+            total_no = sum(data.get('no', 0) for data in scores.values())
             
-            # Reset Session ใหม่
-            user_sessions[user_id] = {
-                'word': word,
-                'meaning': meaning,
-                'hint_given': False
-            }
+            # คำที่ควรทบทวน (ตอบผิดมากกว่าตอบถูก)
+            need_review = []
+            for word, data in scores.items():
+                if data.get('no', 0) > data.get('yes', 0):
+                    need_review.append(word)
             
-            reply_text = (f"🎮 เริ่มเกม!\n\n"
-                          f"❓ คำว่า '{word}' แปลว่าอะไร?\n\n"
-                          f"💡 ตอบภาษาไทยมาเลย (ระบบ offline ตรวจอัตโนมัติ)")
-
-    # === MENU 4: คำใบ้ ===
-    elif user_msg in ["คำใบ้", "hint", "ช่วยด้วย"]:
-        if user_id not in user_sessions:
-            reply_text = "🤔 ยังไม่ได้เริ่มเกมเลยครับ พิมพ์ 'เริ่มเกม' ก่อนนะ"
+            reply_text = (f"📊 สถิติการเรียน\n\n"
+                         f"📚 เรียนทั้งหมด: {total_words} คำ\n"
+                         f"✅ รู้แล้ว: {known_words} คำ\n"
+                         f"❌ ยาก: {difficult_words} คำ\n"
+                         f"📈 ตอบถูก: {total_yes} ครั้ง\n"
+                         f"📉 ตอบผิด: {total_no} ครั้ง\n"
+                         f"📝 ต้องทบทวน: {len(need_review)} คำ")
+            
+            if need_review:
+                reply_text += f"\n\nคำที่ควรทบทวน:\n"
+                for i, word in enumerate(need_review[:5], 1):
+                    reply_text += f"{i}. {word}\n"
+                if len(need_review) > 5:
+                    reply_text += f"... และอีก {len(need_review)-5} คำ"
+    
+    # === MENU: ทบทวน ===
+    elif user_msg in ["ทบทวน", "review", "weak"]:
+        review_words = get_review_words(user_id, 5)
+        
+        if not review_words:
+            reply_text = "🎉 ยินดีด้วย! ตอนนี้คุณยังไม่มีคำศัพท์ที่ต้องทบทวนพิเศษ"
         else:
-            session = user_sessions[user_id]
-            if session.get('hint_given'):
-                reply_text = f"💡 ให้คำใบ้ไปแล้วไงครับ: {session['meaning']}"
-            else:
-                new_score = update_score(user_id, -2)
-                session['hint_given'] = True
-                user_sessions[user_id] = session
+            reply_text = f"📝 คำศัพท์ที่ควรทบทวน ({len(review_words)} คำ)\n\n"
+            
+            for i, word_data in enumerate(review_words, 1):
+                # ดึงข้อมูลเพิ่มเติม
+                try:
+                    vocab_result = supabase.table("vocab").select("*").eq("word", word_data['word']).execute()
+                    if vocab_result.data:
+                        vocab_info = vocab_result.data[0]
+                        example = vocab_info.get('example_sentence', 'ไม่มีตัวอย่าง')
+                        meaning = vocab_info.get('meaning', 'ไม่ระบุ')
+                    else:
+                        example = "ไม่มีตัวอย่าง"
+                        meaning = word_data.get('meaning', 'ไม่ระบุ')
+                except:
+                    example = "ไม่มีตัวอย่าง"
+                    meaning = word_data.get('meaning', 'ไม่ระบุ')
                 
-                reply_text = (f"💡 คำใบ้: {session['meaning']}\n"
-                              f"(-2 คะแนน | เหลือ: {new_score})\n\n"
-                              f"ถ้ารู้แล้วพิมพ์ตอบมาเลย!")
-
-    # === MENU 5: คลังคำศัพท์ ===
-    elif user_msg in ["คลังคำศัพท์", "คลัง", "vocab", "words"]:
-        try:
-            response = supabase.table("vocab").select("word, meaning").order("id", desc=True).limit(20).execute()
-            words = response.data
-            if not words:
-                reply_text = "📭 คลังว่างเปล่าครับ พิมพ์ 'เพิ่ม:[คำศัพท์]' เพื่อเพิ่ม"
-            else:
-                word_list = "\n".join([f"- {item['word']} = {item.get('meaning', '?')}" for item in words])
-                reply_text = f"📚 ศัพท์ 20 คำล่าสุด:\n\n{word_list}"
-        except: 
-            reply_text = "⚠️ ดึงข้อมูลไม่ได้ครับ"
-
-    # === MENU 6: คำที่เรียนแล้ว ===
-    elif user_msg in ["คลัง2", "เรียนแล้ว", "learned"]:
-        score, learned = get_user_score(user_id)
-        if not learned:
-            reply_text = "📭 ยังไม่มีคำที่เรียนแล้วเลยครับ"
-        else:
-            word_list = "\n".join([f"- {word}" for word in learned[:20]])
-            if len(learned) > 20:
-                word_list += f"\n... และอีก {len(learned)-20} คำ"
-            reply_text = f"📚 คำศัพท์ที่เรียนแล้ว ({len(learned)} คำ):\n\n{word_list}"
-
-    # === MENU 7: ลบคำศัพท์ ===
-    elif user_msg.startswith(("ลบ:", "ลบคำ:", "delete:")):
-        try:
-            target = user_msg.split(":", 1)[1].strip()
-            if target:
-                supabase.table("vocab").delete().ilike("word", target).execute()
-                reply_text = f"🗑️ ลบ '{target}' เรียบร้อยครับ"
-            else: 
-                reply_text = "อย่าลืมใส่คำที่ต้องการลบหลัง : ด้วยนะครับ เช่น 'ลบ:learn'"
-        except: 
-            reply_text = "⚠️ ระบบลบมีปัญหา ลองใหม่ครับ"
-
-    # === MENU 8: เพิ่มคำศัพท์ (Offline Mode) ===
-    elif user_msg.lower().startswith(("เพิ่ม:", "add:", "new:")):
-        try:
-            word = user_msg.split(":", 1)[1].strip()
-            if not word:
-                reply_text = "ใส่คำศัพท์หลัง : ด้วยนะครับ เช่น 'เพิ่ม: Resilience'"
-                line_bot_api.reply_message(event.reply_token, TextSendMessage(text=reply_text))
-                return
+                reply_text += f"{i}. {word_data['word']} = {meaning}\n"
+                reply_text += f"   📝 ตัวอย่าง: {example}\n\n"
             
-            # ใช้ offline function
-            result = add_vocab_offline(word)
-            meaning = result["meaning"]
-            example = result["example"]
-            
-            # บันทึกลง database
-            try:
-                supabase.table("vocab").insert({
-                    "word": word, 
-                    "meaning": meaning, 
-                    "example_sentence": example
-                }).execute()
-            except:
-                pass  # ถ้า DB error ก็ยังตอบได้
-            
-            reply_text = (f"✅ เพิ่มคำศัพท์สำเร็จ!\n\n"
-                         f"🔤 คำศัพท์: {word}\n"
-                         f"📖 ความหมาย: {meaning}\n"
-                         f"🗣️ ตัวอย่าง: {example}\n\n"
-                         f"💡 พิมพ์ 'เริ่มเกม' เพื่อเล่นทันที!")
-            
-        except Exception as e:
-            print(f"Add vocab error: {e}")
-            reply_text = "⚠️ มีปัญหาในการเพิ่มคำศัพท์ ลองใหม่อีกครั้งครับ"
-
-    # === MENU 9: ตรวจคำตอบ (Offline Mode) ===
-    else:
-        if user_id not in user_sessions:
-            reply_text = ("🤔 อยากเล่นเกมพิมพ์ 'เริ่มเกม' ได้เลยครับ\n\n"
-                         "💡 หรือพิมพ์ 'คำสั่ง' เพื่อดูเมนูทั้งหมด")
-        else:
-            session = user_sessions[user_id]
-            word = session['word']
-            correct_meaning = session['meaning']
-            
-            # ตรวจคำตอบแบบ offline
-            result = check_answer_offline(word, correct_meaning, user_msg)
-            is_correct = result["is_correct"]
-            feedback = result["feedback"]
+            reply_text += "พิมพ์ 'เริ่มเกม :' เพื่อฝึกฝนคำศัพท์เหล่านี้"
+    
+    # === MENU: เริ่มเกม : ===
+    elif user_msg.startswith("เริ่มเกม :"):
+        # สุ่ม flashcard ใหม่
+        flashcard = get_random_flashcard(user_id)
+        
+        # บันทึก flashcard ปัจจุบัน
+        user_flashcards[user_id] = {
+            'word': flashcard['word'],
+            'meaning': flashcard['meaning'],
+            'question_type': flashcard['question_type'],
+            'correct_answer': flashcard['correct_answer']
+        }
+        
+        reply_text = f"🎮 Flashcard\n\n{flashcard['question']}\n\nตอบได้ = Yes, ตอบไม่ได้ = No"
+    
+    # === MENU: ตัวอย่าง ===
+    elif user_msg in ["ตัวอย่าง", "example", "ex"]:
+        if user_id in user_flashcards:
+            current_card = user_flashcards[user_id]
             
             # ดึงตัวอย่างประโยค
-            examples = get_examples(word, 2)
-            example_txt = "\n".join([f"• {ex}" for ex in examples]) if examples else ""
+            try:
+                result = supabase.table("vocab").select("example_sentence").eq("word", current_card['word']).execute()
+                if result.data and result.data[0].get('example_sentence'):
+                    example = result.data[0]['example_sentence']
+                else:
+                    example = "ไม่มีตัวอย่างประโยคสำหรับคำนี้"
+            except:
+                example = "ไม่มีตัวอย่างประโยคสำหรับคำนี้"
             
-            # ล้าง session
-            del user_sessions[user_id]
-
-            if is_correct:
-                # ✅ ถูกต้อง - ให้คะแนน
-                new_score = update_score(user_id, 10)
-                mark_word_learned(user_id, word)
+            reply_text = f"📝 ตัวอย่างการใช้ '{current_card['word']}':\n\n{example}"
+        else:
+            reply_text = "⚠️ กรุณาพิมพ์ 'เริ่มเกม :' เพื่อเริ่มเกมก่อน"
+    
+    # === MENU: เพิ่มคำศัพท์ ===
+    elif user_msg.startswith("เพิ่มคำศัพท์:"):
+        try:
+            # แยกคำศัพท์และความหมาย
+            parts = user_msg.split(":", 1)[1].strip()
+            if ":" in parts:
+                english_word, thai_meaning = parts.split(":", 1)
+                english_word = english_word.strip()
+                thai_meaning = thai_meaning.strip()
                 
-                reply_text = (f"🎉 ถูกต้อง! (+10 คะแนน)\n\n"
-                             f"💬 {feedback}\n"
-                             f"📊 คะแนนรวมตอนนี้: {new_score}\n")
-                
-                if example_txt:
-                    reply_text += f"\n📝 ตัวอย่างการใช้:\n{example_txt}\n"
-                
-                reply_text += "\n👉 พิมพ์ 'เริ่มเกม' เพื่อเล่นต่อ"
-                
+                # เพิ่มลงฐานข้อมูล
+                try:
+                    supabase.table("vocab").upsert({
+                        "word": english_word.lower(),
+                        "meaning": thai_meaning,
+                        "example_sentence": f"ตัวอย่างประโยคสำหรับ '{english_word}'"
+                    }, on_conflict="word").execute()
+                    
+                    reply_text = f"✅ เพิ่มคำศัพท์สำเร็จ!\n\n{english_word} = {thai_meaning}"
+                except Exception as e:
+                    print(f"Add vocab error: {e}")
+                    reply_text = "⚠️ ไม่สามารถเพิ่มคำศัพท์ได้ในขณะนี้"
             else:
-                # ❌ ผิด
-                new_score = update_score(user_id, -1)
-                
-                reply_text = (f"❌ ยังไม่ถูกนะครับ (-1 คะแนน)\n\n"
-                             f"📖 คำที่ถูกต้อง: {word} → {correct_meaning}\n"
-                             f"💡 {feedback}\n")
-                
-                if example_txt:
-                    reply_text += f"\n📝 ตัวอย่างช่วยจำ:\n{example_txt}\n"
-                
-                reply_text += f"\n📊 คะแนนรวม: {new_score}\n"
-                reply_text += "ไม่เป็นไรครับ! พิมพ์ 'เริ่มเกม' เพื่อลองคำใหม่ได้เลย 😊"
-
+                reply_text = "⚠️ รูปแบบไม่ถูกต้อง\nใช้: เพิ่มคำศัพท์:[คำอังกฤษ]:[คำไทย]\nเช่น: เพิ่มคำศัพท์:apple:แอปเปิ้ล"
+        except:
+            reply_text = "⚠️ รูปแบบไม่ถูกต้อง\nใช้: เพิ่มคำศัพท์:[คำอังกฤษ]:[คำไทย]\nเช่น: เพิ่มคำศัพท์:apple:แอปเปิ้ล"
+    
+    # === การตอบ Yes/No สำหรับ flashcard ===
+    elif user_id in user_flashcards and user_msg.lower() in ["yes", "no", "y", "n", "ใช่", "ไม่"]:
+        current_card = user_flashcards[user_id]
+        word = current_card['word']
+        
+        # แปลงคำตอบเป็น boolean
+        answer_is_yes = user_msg.lower() in ["yes", "y", "ใช่"]
+        
+        # อัพเดทคะแนน
+        update_vocab_score(user_id, word, answer_is_yes)
+        
+        # แสดงคำตอบที่ถูกต้อง
+        if answer_is_yes:
+            reply_text = f"✅ ดีมาก! คุณตอบถูกต้อง\n\n"
+        else:
+            reply_text = f"❌ ไม่เป็นไร มาดูคำตอบกัน\n\n"
+        
+        reply_text += f"คำตอบที่ถูกต้อง: {current_card['correct_answer']}\n\n"
+        
+        # แสดงตัวอย่างประโยคทุกครั้ง
+        try:
+            result = supabase.table("vocab").select("example_sentence").eq("word", word).execute()
+            if result.data and result.data[0].get('example_sentence'):
+                example = result.data[0]['example_sentence']
+                reply_text += f"📝 ตัวอย่าง: {example}\n\n"
+        except:
+            pass
+        
+        reply_text += "พิมพ์ 'เริ่มเกม :' เพื่อเล่นต่อ"
+        
+        # ลบ flashcard ปัจจุบัน
+        del user_flashcards[user_id]
+    
+    # === DEFAULT RESPONSE ===
+    else:
+        if user_id in user_flashcards:
+            # ถ้ามี flashcard กำลังเล่นอยู่
+            reply_text = "⚠️ กรุณาตอบ Yes หรือ No สำหรับ flashcard ปัจจุบัน\nหรือพิมพ์ 'ตัวอย่าง' เพื่อดูตัวอย่างประโยค"
+        else:
+            reply_text = ("🤖 Flashcard Bot\n\n"
+                         "พิมพ์ 'เริ่มเกม :' เพื่อเริ่มทายคำศัพท์\n"
+                         "พิมพ์ 'คำสั่ง' เพื่อดูคำสั่งทั้งหมด\n"
+                         "พิมพ์ 'สถิติ' เพื่อดูสถิติการเรียน")
+    
     # ส่งข้อความกลับ Line
     if reply_text:
         try:
