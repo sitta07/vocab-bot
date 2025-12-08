@@ -507,64 +507,7 @@ def handle_message(event):
         except Exception as e:
             logger.error(f"Add vocab error: {e}")
             reply_text = f"⚠️ มีปัญหากับระบบ: {str(e)[:100]}"
-
-    # === MENU 8: ตรวจสอบสิทธิ์ ===
-    elif user_msg in ["สิทธ์", "สิทธิ์", "สิทธิ", "role", "admin"]:
-        # ตรวจสอบว่าเป็น admin หรือไม่ (ปรับ user_id ตามต้องการ)
-        admin_users = ["U1234567890abcdef1234567890abcdef"]  # เปลี่ยนเป็น ID จริงของคุณ
-        
-        if user_id in admin_users:
-            reply_text = "👑 คุณคือ Admin!\nสามารถใช้งานทุกคำสั่งได้"
-        else:
-            reply_text = "👤 คุณคือ User ปกติ\nสามารถใช้งานคำสั่งพื้นฐานได้"
-
-    # === MENU 9: ตรวจสอบระบบ (สำหรับ Admin) ===
-    elif user_msg == "ตรวจสอบระบบ":
-        admin_users = ["U1234567890abcdef1234567890abcdef"]  # เปลี่ยนเป็น ID จริง
-        
-        if user_id in admin_users:
-            try:
-                # นับจำนวนคำศัพท์
-                vocab_result = supabase.table("vocab").select("*", count="exact").execute()
-                vocab_count = vocab_result.count or 0
-                
-                # นับผู้ใช้
-                user_result = supabase.table("users").select("*", count="exact").execute()
-                user_count = user_result.count or 0
-                
-                # นับคะแนน
-                score_result = supabase.table("user_scores").select("*", count="exact").execute()
-                score_count = score_result.count or 0
-                
-                # ตรวจสอบ sessions
-                active_sessions = len(user_sessions)
-                pending_deletions_count = len(pending_deletions)
-                
-                reply_text = (f"📊 สถิติระบบ:\n\n"
-                            f"🗃️ คำศัพท์ทั้งหมด: {vocab_count} คำ\n"
-                            f"👥 ผู้ใช้ทั้งหมด: {user_count} คน\n"
-                            f"⭐ ผู้ใช้มีคะแนน: {score_count} คน\n"
-                            f"🎮 เซสชั่นปัจจุบัน: {active_sessions}\n"
-                            f"🗑️ รอการยืนยันลบ: {pending_deletions_count}\n"
-                            f"⏰ เวลาปัจจุบัน: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
-            except Exception as e:
-                logger.error(f"System check error: {e}")
-                reply_text = f"⚠️ ตรวจสอบระบบผิดพลาด: {str(e)[:100]}"
-        else:
-            reply_text = "❌ คำสั่งนี้สำหรับ Admin เท่านั้น"
-
-    # === MENU 10: ยกเลิก ===
-    elif user_msg in ["ยกเลิก", "cancel", "stop"]:
-        if user_id in pending_deletions:
-            word = pending_deletions[user_id]
-            del pending_deletions[user_id]
-            reply_text = f"✅ ยกเลิกการลบคำว่า '{word}' แล้ว"
-        elif user_id in user_sessions:
-            word = user_sessions[user_id]['word']
-            del user_sessions[user_id]
-            reply_text = f"✅ ยกเลิกเกมคำว่า '{word}' แล้ว"
-        else:
-            reply_text = "🤔 ไม่มีอะไรให้ยกเลิกครับ"
+            
 
     # === DEFAULT: ตรวจคำตอบ ===
     else:
